@@ -1,5 +1,4 @@
 # Oneida-Network-Steganography-Detector
-# Oneida Network Steganography Detector
 
 Author: **Max Gecse**
 
