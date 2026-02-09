@@ -1,0 +1,696 @@
+/*
+ * Oneida Network Steganography Detector
+ *
+ * Author: Max Gecse
+ *
+ * Combined heuristic detector for network steganography / covert channels:
+ *   - IP ID + timing variance
+ *   - TCP timestamp (TSval) statistics, LSB bias, autocorrelation
+ *   - Timing entropy and corrected conditional entropy (CCE)
+ *   - Chi-square goodness-of-fit on IPD histogram
+ *
+ * Linux compile example:
+ *   gcc -O2 -Wall steg_detect_all.c -lpcap -lm -o oneida
+ *
+ * Run (as root):
+ *   ./oneida eth0
+ */
+
+#include <pcap.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <arpa/inet.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <sys/time.h>
+
+/* General parameters */
+#define WINDOW_SIZE             200
+#define MAX_HOSTS               1024
+#define STD_IPID_THRESHOLD      500.0
+#define STD_TIME_THRESHOLD      0.05
+#define ALERT_MIN_PACKETS       30
+
+/* TCP timestamp analysis */
+#define ALERT_MIN_TS_SAMPLES    60
+#define STD_TSVAL_THRESHOLD     5000.0
+#define LSB_BIAS_THRESHOLD      0.75
+
+/* Autocorrelation settings */
+#define MAX_LAG                 20
+#define ACF_THRESHOLD           0.4
+
+/* Entropy / CCE parameters (timing) */
+#define ENTROPY_BIN_COUNT       20
+#define ENTROPY_MIN_SAMPLES     60
+#define ENTROPY_LOW_THRESHOLD   2.5
+
+#define CCE_MAX_PATTERN_LEN     3
+#define CCE_BIN_COUNT           10
+#define CCE_MIN_IPD_SAMPLES     80
+#define CCE_LOW_THRESHOLD       1.5
+
+/* Chi-square config */
+#define CHI_BIN_COUNT           ENTROPY_BIN_COUNT
+#define CHI_MIN_EXPECTED_COUNT  5.0
+#define CHI_SIG_THRESHOLD       30.0
+
+/* Example baseline IPD distribution; replace with learned baseline */
+static double ipd_expected_prob[CHI_BIN_COUNT] = {
+    0.05, 0.05, 0.05, 0.05, 0.05,
+    0.10, 0.10, 0.15, 0.20, 0.20
+};
+
+typedef struct {
+    char src_ip[INET_ADDRSTRLEN];
+
+    /* IPID + timing */
+    unsigned short ip_ids[WINDOW_SIZE];
+    double times[WINDOW_SIZE];
+    int count;
+
+    /* TCP timestamps */
+    unsigned int tsvals[WINDOW_SIZE];
+    int ts_count;
+    int ts_lsb_ones;
+    int ts_lsb_zeros;
+} host_data_t;
+
+static host_data_t hosts[MAX_HOSTS];
+
+/* Time helper */
+double now_secs(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1e6;
+}
+
+/* Host table */
+host_data_t* get_host(const char *src_ip) {
+    int i;
+    for (i = 0; i < MAX_HOSTS; i++) {
+        if (hosts[i].src_ip[0] == '\0') {
+            strncpy(hosts[i].src_ip, src_ip, sizeof(hosts[i].src_ip) - 1);
+            hosts[i].src_ip[sizeof(hosts[i].src_ip) - 1] = '\0';
+            return &hosts[i];
+        }
+        if (strncmp(hosts[i].src_ip, src_ip, sizeof(hosts[i].src_ip)) == 0) {
+            return &hosts[i];
+        }
+    }
+    return NULL;
+}
+
+/* Sliding window add for IPID+time */
+void add_sample_ipid(host_data_t *h, unsigned short ip_id, double t) {
+    if (h->count < WINDOW_SIZE) {
+        h->ip_ids[h->count] = ip_id;
+        h->times[h->count] = t;
+        h->count++;
+    } else {
+        int i;
+        for (i = 1; i < WINDOW_SIZE; i++) {
+            h->ip_ids[i - 1] = h->ip_ids[i];
+            h->times[i - 1] = h->times[i];
+        }
+        h->ip_ids[WINDOW_SIZE - 1] = ip_id;
+        h->times[WINDOW_SIZE - 1] = t;
+    }
+}
+
+/* Sliding window add for TSval + LSB counts */
+void add_sample_tsval(host_data_t *h, unsigned int tsval) {
+    if (h->ts_count < WINDOW_SIZE) {
+        h->tsvals[h->ts_count] = tsval;
+        h->ts_count++;
+    } else {
+        int i;
+        for (i = 1; i < WINDOW_SIZE; i++) {
+            h->tsvals[i - 1] = h->tsvals[i];
+        }
+        h->tsvals[WINDOW_SIZE - 1] = tsval;
+    }
+    if (tsval & 1U) h->ts_lsb_ones++;
+    else            h->ts_lsb_zeros++;
+}
+
+/* Basic stats helpers */
+double compute_std_diff_us(const unsigned short *arr, int n) {
+    if (n < 2) return 0.0;
+    double diffs[WINDOW_SIZE];
+    double sum = 0.0, mean, var = 0.0;
+    int i;
+    for (i = 1; i < n; i++) {
+        diffs[i - 1] = (double)((int)arr[i] - (int)arr[i - 1]);
+        sum += diffs[i - 1];
+    }
+    int m = n - 1;
+    mean = sum / m;
+    for (i = 0; i < m; i++) {
+        double d = diffs[i] - mean;
+        var += d * d;
+    }
+    var /= m;
+    return sqrt(var);
+}
+
+double compute_std_diff_double(const double *arr, int n) {
+    if (n < 2) return 0.0;
+    double diffs[WINDOW_SIZE];
+    double sum = 0.0, mean, var = 0.0;
+    int i;
+    for (i = 1; i < n; i++) {
+        diffs[i - 1] = arr[i] - arr[i - 1];
+        sum += diffs[i - 1];
+    }
+    int m = n - 1;
+    mean = sum / m;
+    for (i = 0; i < m; i++) {
+        double d = diffs[i] - mean;
+        var += d * d;
+    }
+    var /= m;
+    return sqrt(var);
+}
+
+double compute_std_diff_ui(const unsigned int *arr, int n) {
+    if (n < 2) return 0.0;
+    double diffs[WINDOW_SIZE];
+    double sum = 0.0, mean, var = 0.0;
+    int i;
+    for (i = 1; i < n; i++) {
+        diffs[i - 1] = (double)((long long)arr[i] - (long long)arr[i - 1]);
+        sum += diffs[i - 1];
+    }
+    int m = n - 1;
+    mean = sum / m;
+    for (i = 0; i < m; i++) {
+        double d = diffs[i] - mean;
+        var += d * d;
+    }
+    var /= m;
+    return sqrt(var);
+}
+
+/* Autocorrelation for TSvals */
+void compute_acf_ui(const unsigned int *arr, int n, int max_lag,
+                    double *acf_out) {
+    int i, k;
+    if (n < 2) {
+        for (k = 0; k <= max_lag; k++) acf_out[k] = 0.0;
+        return;
+    }
+
+    double mean = 0.0;
+    for (i = 0; i < n; i++) mean += (double)arr[i];
+    mean /= (double)n;
+
+    double denom = 0.0;
+    for (i = 0; i < n; i++) {
+        double x = (double)arr[i] - mean;
+        denom += x * x;
+    }
+    if (denom == 0.0) {
+        for (k = 0; k <= max_lag; k++) acf_out[k] = 0.0;
+        return;
+    }
+
+    acf_out[0] = 1.0;
+    for (k = 1; k <= max_lag; k++) {
+        if (k >= n) {
+            acf_out[k] = 0.0;
+            continue;
+        }
+        double num = 0.0;
+        for (i = 0; i + k < n; i++) {
+            double x1 = (double)arr[i] - mean;
+            double x2 = (double)arr[i + k] - mean;
+            num += x1 * x2;
+        }
+        acf_out[k] = num / denom;
+    }
+}
+
+/* Shannon entropy from probabilities */
+double entropy_from_probs(const double *p, int n) {
+    double H = 0.0;
+    for (int i = 0; i < n; i++) {
+        if (p[i] <= 0.0) continue;
+        H -= p[i] * (log(p[i]) / log(2.0));
+    }
+    return H;
+}
+
+/* IPID + timing variance analysis */
+void analyze_host_ipid(host_data_t *h) {
+    if (h->count < ALERT_MIN_PACKETS) return;
+
+    double std_ipid = compute_std_diff_us(h->ip_ids, h->count);
+    double std_time = compute_std_diff_double(h->times, h->count);
+
+    if (std_ipid > STD_IPID_THRESHOLD || std_time < STD_TIME_THRESHOLD) {
+        printf("[ALERT] IPID/timing anomaly from %s\n", h->src_ip);
+        printf("        IPID std(diff): %.2f, time std(diff): %.6f\n",
+               std_ipid, std_time);
+    }
+}
+
+/* TCP timestamps analysis (TSval, LSB bias, ACF) */
+void analyze_host_ts(host_data_t *h) {
+    if (h->ts_count < ALERT_MIN_TS_SAMPLES) return;
+
+    double std_tsval = compute_std_diff_ui(h->tsvals, h->ts_count);
+
+    int total_lsb = h->ts_lsb_ones + h->ts_lsb_zeros;
+    double p1 = 0.0;
+    if (total_lsb > 0) {
+        p1 = (double)h->ts_lsb_ones / (double)total_lsb;
+    }
+
+    int suspicious = 0;
+    if (std_tsval > STD_TSVAL_THRESHOLD) suspicious = 1;
+    if (fabs(p1 - 0.5) > (LSB_BIAS_THRESHOLD - 0.5)) suspicious = 1;
+
+    double acf[MAX_LAG + 1];
+    compute_acf_ui(h->tsvals, h->ts_count, MAX_LAG, acf);
+
+    double max_abs_acf = 0.0;
+    int max_k = 0;
+    for (int k = 1; k <= MAX_LAG; k++) {
+        double a = fabs(acf[k]);
+        if (a > max_abs_acf) {
+            max_abs_acf = a;
+            max_k = k;
+        }
+    }
+
+    if (max_abs_acf > ACF_THRESHOLD) {
+        suspicious = 1;
+        printf("[ALERT] TSval autocorrelation anomaly from %s\n",
+               h->src_ip);
+        printf("        max |R(k)| at lag %d: %.3f\n", max_k, max_abs_acf);
+    }
+
+    if (suspicious) {
+        printf("[ALERT] TCP timestamp anomaly from %s\n", h->src_ip);
+        printf("        TSval std(diff): %.2f, LSB(1) fraction: %.3f\n",
+               std_tsval, p1);
+    }
+}
+
+/* ---- CCE helpers ---- */
+
+/* Map IPDs to discrete symbols 0..(CCE_BIN_COUNT-1) */
+int build_ipd_symbols(const double *times, int n_times,
+                      unsigned char *sym_out, int max_sym) {
+    if (n_times < 2) return 0;
+
+    double ipd[WINDOW_SIZE - 1];
+    int ipd_count = 0;
+    for (int i = 1; i < n_times && ipd_count < max_sym; i++) {
+        double d = times[i] - times[i - 1];
+        if (d <= 0.0) continue;
+        ipd[ipd_count++] = d;
+    }
+    if (ipd_count < 2) return 0;
+
+    double min_d = ipd[0], max_d = ipd[0];
+    for (int i = 1; i < ipd_count; i++) {
+        if (ipd[i] < min_d) min_d = ipd[i];
+        if (ipd[i] > max_d) max_d = ipd[i];
+    }
+    if (max_d <= min_d) return 0;
+
+    for (int i = 0; i < ipd_count; i++) {
+        double norm = (ipd[i] - min_d) / (max_d - min_d);
+        int bin = (int)(norm * CCE_BIN_COUNT);
+        if (bin >= CCE_BIN_COUNT) bin = CCE_BIN_COUNT - 1;
+        if (bin < 0) bin = 0;
+        sym_out[i] = (unsigned char)bin;
+    }
+    return ipd_count;
+}
+
+/* Corrected conditional entropy for pattern length m */
+double compute_cce_for_m(const unsigned char *sym, int n_sym, int m) {
+    if (m < 1 || n_sym < m + 1) return 0.0;
+
+    typedef struct {
+        unsigned char pat[CCE_MAX_PATTERN_LEN];
+        int count;
+    } pat_entry_t;
+    typedef struct {
+        unsigned char pat[CCE_MAX_PATTERN_LEN - 1];
+        int count;
+    } prefix_entry_t;
+
+    pat_entry_t patterns[2048];
+    int pat_used = 0;
+    prefix_entry_t prefixes[2048];
+    int pre_used = 0;
+
+    int total_patterns = 0;
+    int unique_patterns = 0;
+
+    for (int i = 0; i + m <= n_sym; i++) {
+        const unsigned char *p = &sym[i];
+        const unsigned char *prefix = &sym[i];
+
+        int idx = -1;
+        for (int j = 0; j < pat_used; j++) {
+            int same = 1;
+            for (int k = 0; k < m; k++) {
+                if (patterns[j].pat[k] != p[k]) { same = 0; break; }
+            }
+            if (same) { idx = j; break; }
+        }
+        if (idx == -1) {
+            if (pat_used >= (int)(sizeof(patterns)/sizeof(patterns[0]))) break;
+            idx = pat_used++;
+            memcpy(patterns[idx].pat, p, m);
+            patterns[idx].count = 0;
+            unique_patterns++;
+        }
+        patterns[idx].count++;
+        total_patterns++;
+
+        if (m > 1) {
+            int pre_idx = -1;
+            for (int j = 0; j < pre_used; j++) {
+                int same = 1;
+                for (int k = 0; k < m - 1; k++) {
+                    if (prefixes[j].pat[k] != prefix[k]) { same = 0; break; }
+                }
+                if (same) { pre_idx = j; break; }
+            }
+            if (pre_idx == -1) {
+                if (pre_used >= (int)(sizeof(prefixes)/sizeof(prefixes[0]))) break;
+                pre_idx = pre_used++;
+                memcpy(prefixes[pre_idx].pat, prefix, m - 1);
+                prefixes[pre_idx].count = 0;
+            }
+            prefixes[pre_idx].count++;
+        }
+    }
+
+    if (total_patterns == 0) return 0.0;
+
+    double CE = 0.0;
+    if (m == 1) {
+        double probs[2048];
+        for (int i = 0; i < pat_used; i++) {
+            probs[i] = (double)patterns[i].count / (double)total_patterns;
+        }
+        CE = entropy_from_probs(probs, pat_used);
+    } else {
+        for (int pi = 0; pi < pre_used; pi++) {
+            int prefix_count = prefixes[pi].count;
+            if (prefix_count == 0) continue;
+
+            int sym_counts[CCE_BIN_COUNT];
+            memset(sym_counts, 0, sizeof(sym_counts));
+            int total_suffix = 0;
+
+            for (int i = 0; i < pat_used; i++) {
+                int same = 1;
+                for (int k = 0; k < m - 1; k++) {
+                    if (patterns[i].pat[k] != prefixes[pi].pat[k]) { same = 0; break; }
+                }
+                if (!same) continue;
+                unsigned char last = patterns[i].pat[m - 1];
+                if (last >= CCE_BIN_COUNT) continue;
+                sym_counts[last] += patterns[i].count;
+                total_suffix += patterns[i].count;
+            }
+            if (total_suffix == 0) continue;
+
+            double p_prefix = (double)prefix_count / (double)total_patterns;
+
+            double probs[CCE_BIN_COUNT];
+            for (int s = 0; s < CCE_BIN_COUNT; s++) {
+                probs[s] = (double)sym_counts[s] / (double)total_suffix;
+            }
+            double H_suffix = entropy_from_probs(probs, CCE_BIN_COUNT);
+            CE += p_prefix * H_suffix;
+        }
+    }
+
+    double perc_unique = (double)unique_patterns / (double)total_patterns;
+
+    int x1_counts[CCE_BIN_COUNT];
+    memset(x1_counts, 0, sizeof(x1_counts));
+    for (int i = 0; i < pat_used; i++) {
+        int s = patterns[i].pat[0];
+        if (s < 0 || s >= CCE_BIN_COUNT) continue;
+        x1_counts[s] += patterns[i].count;
+    }
+    double x1_probs[CCE_BIN_COUNT];
+    for (int i = 0; i < CCE_BIN_COUNT; i++) {
+        x1_probs[i] = (double)x1_counts[i] / (double)total_patterns;
+    }
+    double EN_X1 = entropy_from_probs(x1_probs, CCE_BIN_COUNT);
+
+    double CCE = CE + perc_unique * EN_X1;
+    return CCE;
+}
+
+double compute_corrected_conditional_entropy(const double *times, int n_times) {
+    unsigned char sym[WINDOW_SIZE];
+    int n_sym = build_ipd_symbols(times, n_times, sym, WINDOW_SIZE);
+    if (n_sym < CCE_MIN_IPD_SAMPLES) return 0.0;
+
+    double min_cce = 1e9;
+    for (int m = 1; m <= CCE_MAX_PATTERN_LEN; m++) {
+        double cce = compute_cce_for_m(sym, n_sym, m);
+        if (cce > 0.0 && cce < min_cce) {
+            min_cce = cce;
+        }
+    }
+    if (min_cce == 1e9) min_cce = 0.0;
+    return min_cce;
+}
+
+/* Chi-square goodness-of-fit on IPD histogram */
+double compute_chi_square(const int *obs_counts, int bin_count, int total_obs) {
+    if (total_obs <= 0) return 0.0;
+
+    double chisq = 0.0;
+    for (int i = 0; i < bin_count; i++) {
+        double expected = ipd_expected_prob[i] * (double)total_obs;
+        if (expected < CHI_MIN_EXPECTED_COUNT) continue;
+        double diff = (double)obs_counts[i] - expected;
+        chisq += (diff * diff) / expected;
+    }
+    return chisq;
+}
+
+/* Combined timing entropy + CCE + chi-square analysis */
+void analyze_timing_entropy_cce_chi(host_data_t *h) {
+    if (h->count < CCE_MIN_IPD_SAMPLES) return;
+
+    int n_times = h->count;
+    double ipd[WINDOW_SIZE - 1];
+    int ipd_count = 0;
+
+    for (int i = 1; i < n_times; i++) {
+        double d = h->times[i] - h->times[i - 1];
+        if (d <= 0.0) continue;
+        ipd[ipd_count++] = d;
+    }
+    if (ipd_count < CCE_MIN_IPD_SAMPLES) return;
+
+    double min_d = ipd[0], max_d = ipd[0];
+    for (int i = 1; i < ipd_count; i++) {
+        if (ipd[i] < min_d) min_d = ipd[i];
+        if (ipd[i] > max_d) max_d = ipd[i];
+    }
+    if (max_d <= min_d) return;
+
+    int hist_counts[ENTROPY_BIN_COUNT];
+    memset(hist_counts, 0, sizeof(hist_counts));
+
+    double hist_probs[ENTROPY_BIN_COUNT];
+    memset(hist_probs, 0, sizeof(hist_probs));
+
+    for (int i = 0; i < ipd_count; i++) {
+        double norm = (ipd[i] - min_d) / (max_d - min_d);
+        int bin = (int)(norm * ENTROPY_BIN_COUNT);
+        if (bin >= ENTROPY_BIN_COUNT) bin = ENTROPY_BIN_COUNT - 1;
+        if (bin < 0) bin = 0;
+        hist_counts[bin] += 1;
+        hist_probs[bin] += 1.0;
+    }
+    for (int i = 0; i < ENTROPY_BIN_COUNT; i++) {
+        hist_probs[i] /= (double)ipd_count;
+    }
+
+    double H = entropy_from_probs(hist_probs, ENTROPY_BIN_COUNT);
+    double CCE = compute_corrected_conditional_entropy(h->times, h->count);
+    double chisq = compute_chi_square(hist_counts, ENTROPY_BIN_COUNT, ipd_count);
+
+    int suspicious = 0;
+    if (H < ENTROPY_LOW_THRESHOLD) suspicious = 1;
+    if (CCE > 0.0 && CCE < CCE_LOW_THRESHOLD) suspicious = 1;
+    if (chisq > CHI_SIG_THRESHOLD) suspicious = 1;
+
+    if (suspicious) {
+        printf("[ALERT] Timing anomaly (entropy/CCE/chi-square) from %s\n",
+               h->src_ip);
+        printf("        H: %.3f bits, CCE: %.3f bits, chi^2: %.2f\n",
+               H, CCE, chisq);
+    }
+}
+
+/* Parse TCP options to extract TSval if present */
+void parse_tcp_options_and_tsval(const struct tcphdr *tcph,
+                                 const u_char *tcp_start,
+                                 int tcp_len,
+                                 unsigned int *tsval_out,
+                                 int *has_ts) {
+    *has_ts = 0;
+    *tsval_out = 0;
+
+    int hdr_len = tcph->doff * 4;
+    if (hdr_len <= (int)sizeof(struct tcphdr) || hdr_len > tcp_len) return;
+
+    int opt_len = hdr_len - (int)sizeof(struct tcphdr);
+    const u_char *opt_ptr = tcp_start + sizeof(struct tcphdr);
+    int i = 0;
+
+    while (i < opt_len) {
+        uint8_t kind = opt_ptr[i];
+        if (kind == 0) break;
+        else if (kind == 1) {
+            i += 1;
+            continue;
+        } else {
+            if (i + 1 >= opt_len) break;
+            uint8_t len = opt_ptr[i + 1];
+            if (len < 2 || i + len > opt_len) break;
+
+            if (kind == 8 && len == 10) {
+                if (len >= 10 && i + 10 <= opt_len) {
+                    const u_char *p = &opt_ptr[i + 2];
+                    unsigned int tsval;
+                    memcpy(&tsval, p, sizeof(unsigned int));
+                    tsval = ntohl(tsval);
+                    *tsval_out = tsval;
+                    *has_ts = 1;
+                }
+            }
+            i += len;
+        }
+    }
+}
+
+/* Packet handler */
+void packet_handler(u_char *user, const struct pcap_pkthdr *hdr,
+                    const u_char *packet) {
+    (void)user;
+
+    if (hdr->caplen < 14 + (int)sizeof(struct ip)) return;
+    const struct ip *iph = (const struct ip *)(packet + 14);
+    if (iph->ip_v != 4) return;
+
+    int ip_hdr_len = iph->ip_hl * 4;
+    if (ip_hdr_len < (int)sizeof(struct ip)) return;
+    if (hdr->caplen < 14 + ip_hdr_len) return;
+
+    char src_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(iph->ip_src), src_ip, sizeof(src_ip));
+
+    host_data_t *h = get_host(src_ip);
+    if (!h) return;
+
+    double t = now_secs();
+    unsigned short ip_id = ntohs(iph->ip_id);
+
+    add_sample_ipid(h, ip_id, t);
+    analyze_host_ipid(h);
+    analyze_timing_entropy_cce_chi(h);
+
+    if (iph->ip_p != IPPROTO_TCP) return;
+
+    const u_char *tcp_start = (const u_char *)iph + ip_hdr_len;
+    if (hdr->caplen < (tcp_start - packet) + (int)sizeof(struct tcphdr)) return;
+
+    const struct tcphdr *tcph = (const struct tcphdr *)tcp_start;
+    int tcp_len = ntohs(iph->ip_len) - ip_hdr_len;
+    if (tcp_len < (int)sizeof(struct tcphdr)) return;
+
+    unsigned int tsval;
+    int has_ts;
+    parse_tcp_options_and_tsval(tcph, tcp_start, tcp_len, &tsval, &has_ts);
+    if (has_ts) {
+        add_sample_tsval(h, tsval);
+        analyze_host_ts(h);
+    }
+}
+
+/* Main */
+int main(int argc, char *argv[]) {
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t *handle;
+    char *dev;
+
+    if (argc >= 2) {
+        dev = argv[1];
+    } else {
+        dev = pcap_lookupdev(errbuf);
+        if (dev == NULL) {
+            fprintf(stderr, "Could not find default device: %s\n", errbuf);
+            return 1;
+        }
+    }
+
+    printf("Oneida Network Steganography Detector\n");
+    printf("Author: Max Gecse\n");
+    printf("Using device: %s\n", dev);
+
+    handle = pcap_open_live(dev, 65535, 1, 1000, errbuf);
+    if (handle == NULL) {
+        fprintf(stderr, "Couldn't open device %s: %s\n", dev, errbuf);
+        return 1;
+    }
+
+    struct bpf_program fp;
+    char filter_exp[] = "ip and tcp";
+    bpf_u_int32 net = 0, mask = 0;
+
+    if (pcap_lookupnet(dev, &net, &mask, errbuf) == -1) {
+        fprintf(stderr, "WARNING: Couldn't get netmask for device %s: %s\n",
+                dev, errbuf);
+        net = 0;
+        mask = 0;
+    }
+
+    if (pcap_compile(handle, &fp, filter_exp, 0, net) == -1) {
+        fprintf(stderr, "Couldn't parse filter %s: %s\n", filter_exp,
+                pcap_geterr(handle));
+        pcap_close(handle);
+        return 1;
+    }
+
+    if (pcap_setfilter(handle, &fp) == -1) {
+        fprintf(stderr, "Couldn't install filter %s: %s\n", filter_exp,
+                pcap_geterr(handle));
+        pcap_freecode(&fp);
+        pcap_close(handle);
+        return 1;
+    }
+
+    pcap_freecode(&fp);
+
+    printf("Starting capture (Ctrl+C to stop)...\n");
+    memset(hosts, 0, sizeof(hosts));
+
+    if (pcap_loop(handle, -1, packet_handler, NULL) == -1) {
+        fprintf(stderr, "Error in pcap_loop: %s\n", pcap_geterr(handle));
+    }
+
+    pcap_close(handle);
+    return 0;
+}
+
