@@ -183,9 +183,6 @@ Recommended workflow:
 
 ## License
 
-Add your preferred license here, for example:
-
-```text
 MIT License
 
 Copyright (c) 2026 Max Gecse
