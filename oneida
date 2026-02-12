@@ -1,22 +1,18 @@
 /*
- * Oneida Network Steganography Detector
+ * Oneida Network Steganography Detector (updated)
  *
  * Author: Max Gecse
+ * Updates: L2-type support, ring buffers, safer stats, stricter parsing.
  *
  * Combined heuristic detector for network steganography / covert channels:
- *   - IP ID + timing variance
+ *   - IP ID + timing variance (with wrap-around handling)
  *   - TCP timestamp (TSval) statistics, LSB bias, autocorrelation
  *   - Timing entropy and corrected conditional entropy (CCE)
  *   - Chi-square goodness-of-fit on IPD histogram
- *
- * Linux compile example:
- *   gcc -O2 -Wall steg_detect_all.c -lpcap -lm -o oneida
- *
- * Run (as root):
- *   ./oneida eth0
  */
 
 #include <pcap.h>
+#include <pcap/dlt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +21,7 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <sys/time.h>
+#include <sys/socket.h>
 
 /* General parameters */
 #define WINDOW_SIZE             200
@@ -63,17 +60,31 @@ static double ipd_expected_prob[CHI_BIN_COUNT] = {
     0.10, 0.10, 0.15, 0.20, 0.20
 };
 
+/* Global link-layer info (set in main, used in packet_handler). */
+static int g_datalink_type = DLT_EN10MB;
+static int g_l2_len        = 14;
+
+/* Per-host sliding-window data (ring buffers). */
 typedef struct {
     char src_ip[INET_ADDRSTRLEN];
 
-    /* IPID + timing */
+    /* IPID + timing ring buffer */
     unsigned short ip_ids[WINDOW_SIZE];
     double times[WINDOW_SIZE];
-    int count;
+    int count;          /* number of valid samples, <= WINDOW_SIZE */
+    int ip_index;       /* index of next write */
 
-    /* TCP timestamps */
+    /* TCP timestamps ring buffer */
     unsigned int tsvals[WINDOW_SIZE];
-    int ts_count;
+    int ts_count;       /* number of valid TS samples, <= WINDOW_SIZE */
+    int ts_index;       /* next write index */
+
+    /* LSB statistics per-window (mirrors TS ring) */
+    unsigned char ts_lsb_bits[WINDOW_SIZE];
+    int ts_lsb_ones_window;
+    int ts_lsb_zeros_window;
+
+    /* Optional lifetime counters */
     int ts_lsb_ones;
     int ts_lsb_zeros;
 } host_data_t;
@@ -103,113 +114,167 @@ host_data_t* get_host(const char *src_ip) {
     return NULL;
 }
 
-/* Sliding window add for IPID+time */
+/* IP ID wrap-around aware delta (16-bit ring). */
+static inline double ipid_delta(unsigned short a, unsigned short b) {
+    int diff = (int)a - (int)b;
+    if (diff > 32767)  diff -= 65536;
+    if (diff < -32768) diff += 65536;
+    return (double)diff;
+}
+
+/* Ring-buffer helpers: logical index 0 = oldest, count-1 = newest. */
+static inline unsigned short ipid_at(const host_data_t *h, int i) {
+    int idx = (h->ip_index + WINDOW_SIZE - h->count + i) % WINDOW_SIZE;
+    return h->ip_ids[idx];
+}
+
+static inline double time_at(const host_data_t *h, int i) {
+    int idx = (h->ip_index + WINDOW_SIZE - h->count + i) % WINDOW_SIZE;
+    return h->times[idx];
+}
+
+static inline unsigned int tsval_at(const host_data_t *h, int i) {
+    int idx = (h->ts_index + WINDOW_SIZE - h->ts_count + i) % WINDOW_SIZE;
+    return h->tsvals[idx];
+}
+
+/* Sliding window add for IPID+time (ring buffer). */
 void add_sample_ipid(host_data_t *h, unsigned short ip_id, double t) {
     if (h->count < WINDOW_SIZE) {
-        h->ip_ids[h->count] = ip_id;
-        h->times[h->count] = t;
         h->count++;
-    } else {
-        int i;
-        for (i = 1; i < WINDOW_SIZE; i++) {
-            h->ip_ids[i - 1] = h->ip_ids[i];
-            h->times[i - 1] = h->times[i];
-        }
-        h->ip_ids[WINDOW_SIZE - 1] = ip_id;
-        h->times[WINDOW_SIZE - 1] = t;
     }
+    h->ip_ids[h->ip_index] = ip_id;
+    h->times[h->ip_index]  = t;
+    h->ip_index = (h->ip_index + 1) % WINDOW_SIZE;
 }
 
-/* Sliding window add for TSval + LSB counts */
+/* Sliding window add for TSval + per-window LSB counts (ring buffer). */
 void add_sample_tsval(host_data_t *h, unsigned int tsval) {
-    if (h->ts_count < WINDOW_SIZE) {
-        h->tsvals[h->ts_count] = tsval;
-        h->ts_count++;
-    } else {
-        int i;
-        for (i = 1; i < WINDOW_SIZE; i++) {
-            h->tsvals[i - 1] = h->tsvals[i];
-        }
-        h->tsvals[WINDOW_SIZE - 1] = tsval;
-    }
+    /* Lifetime counters (optional) */
     if (tsval & 1U) h->ts_lsb_ones++;
     else            h->ts_lsb_zeros++;
+
+    /* Update per-window LSB stats: remove old bit, insert new bit. */
+    unsigned char new_bit = (tsval & 1U) ? 1U : 0U;
+
+    if (h->ts_count < WINDOW_SIZE) {
+        /* Growing window: no removal needed yet. */
+        h->tsvals[h->ts_index] = tsval;
+        h->ts_lsb_bits[h->ts_index] = new_bit;
+        if (new_bit) h->ts_lsb_ones_window++;
+        else         h->ts_lsb_zeros_window++;
+        h->ts_index = (h->ts_index + 1) % WINDOW_SIZE;
+        h->ts_count++;
+    } else {
+        /* Full window: overwrite oldest entry at ts_index. */
+        unsigned char old_bit = h->ts_lsb_bits[h->ts_index];
+        if (old_bit) h->ts_lsb_ones_window--;
+        else         h->ts_lsb_zeros_window--;
+
+        h->tsvals[h->ts_index] = tsval;
+        h->ts_lsb_bits[h->ts_index] = new_bit;
+        if (new_bit) h->ts_lsb_ones_window++;
+        else         h->ts_lsb_zeros_window++;
+
+        h->ts_index = (h->ts_index + 1) % WINDOW_SIZE;
+    }
 }
 
-/* Basic stats helpers */
-double compute_std_diff_us(const unsigned short *arr, int n) {
+/* Basic stats helpers using ring buffers */
+
+double compute_std_diff_us_host(const host_data_t *h) {
+    int n = h->count;
     if (n < 2) return 0.0;
-    double diffs[WINDOW_SIZE];
+
     double sum = 0.0, mean, var = 0.0;
     int i;
+
     for (i = 1; i < n; i++) {
-        diffs[i - 1] = (double)((int)arr[i] - (int)arr[i - 1]);
-        sum += diffs[i - 1];
+        unsigned short prev = ipid_at(h, i - 1);
+        unsigned short curr = ipid_at(h, i);
+        double d = ipid_delta(curr, prev);
+        sum += d;
     }
     int m = n - 1;
     mean = sum / m;
-    for (i = 0; i < m; i++) {
-        double d = diffs[i] - mean;
-        var += d * d;
+
+    for (i = 1; i < n; i++) {
+        unsigned short prev = ipid_at(h, i - 1);
+        unsigned short curr = ipid_at(h, i);
+        double d = ipid_delta(curr, prev);
+        double diff = d - mean;
+        var += diff * diff;
     }
     var /= m;
     return sqrt(var);
 }
 
-double compute_std_diff_double(const double *arr, int n) {
+double compute_std_diff_time_host(const host_data_t *h) {
+    int n = h->count;
     if (n < 2) return 0.0;
-    double diffs[WINDOW_SIZE];
+
     double sum = 0.0, mean, var = 0.0;
     int i;
+
     for (i = 1; i < n; i++) {
-        diffs[i - 1] = arr[i] - arr[i - 1];
-        sum += diffs[i - 1];
+        double d = time_at(h, i) - time_at(h, i - 1);
+        sum += d;
     }
     int m = n - 1;
     mean = sum / m;
-    for (i = 0; i < m; i++) {
-        double d = diffs[i] - mean;
-        var += d * d;
+
+    for (i = 1; i < n; i++) {
+        double d = time_at(h, i) - time_at(h, i - 1);
+        double diff = d - mean;
+        var += diff * diff;
     }
     var /= m;
     return sqrt(var);
 }
 
-double compute_std_diff_ui(const unsigned int *arr, int n) {
+double compute_std_diff_ts_host(const host_data_t *h) {
+    int n = h->ts_count;
     if (n < 2) return 0.0;
-    double diffs[WINDOW_SIZE];
+
     double sum = 0.0, mean, var = 0.0;
     int i;
+
     for (i = 1; i < n; i++) {
-        diffs[i - 1] = (double)((long long)arr[i] - (long long)arr[i - 1]);
-        sum += diffs[i - 1];
+        double d = (double)((long long)tsval_at(h, i) -
+                            (long long)tsval_at(h, i - 1));
+        sum += d;
     }
     int m = n - 1;
     mean = sum / m;
-    for (i = 0; i < m; i++) {
-        double d = diffs[i] - mean;
-        var += d * d;
+
+    for (i = 1; i < n; i++) {
+        double d = (double)((long long)tsval_at(h, i) -
+                            (long long)tsval_at(h, i - 1));
+        double diff = d - mean;
+        var += diff * diff;
     }
     var /= m;
     return sqrt(var);
 }
 
-/* Autocorrelation for TSvals */
-void compute_acf_ui(const unsigned int *arr, int n, int max_lag,
-                    double *acf_out) {
+/* Autocorrelation for TSvals using ring buffer */
+void compute_acf_ts_host(const host_data_t *h, int max_lag,
+                         double *acf_out) {
+    int n = h->ts_count;
     int i, k;
+
     if (n < 2) {
         for (k = 0; k <= max_lag; k++) acf_out[k] = 0.0;
         return;
     }
 
     double mean = 0.0;
-    for (i = 0; i < n; i++) mean += (double)arr[i];
+    for (i = 0; i < n; i++) mean += (double)tsval_at(h, i);
     mean /= (double)n;
 
     double denom = 0.0;
     for (i = 0; i < n; i++) {
-        double x = (double)arr[i] - mean;
+        double x = (double)tsval_at(h, i) - mean;
         denom += x * x;
     }
     if (denom == 0.0) {
@@ -225,20 +290,24 @@ void compute_acf_ui(const unsigned int *arr, int n, int max_lag,
         }
         double num = 0.0;
         for (i = 0; i + k < n; i++) {
-            double x1 = (double)arr[i] - mean;
-            double x2 = (double)arr[i + k] - mean;
+            double x1 = (double)tsval_at(h, i) - mean;
+            double x2 = (double)tsval_at(h, i + k) - mean;
             num += x1 * x2;
         }
         acf_out[k] = num / denom;
     }
 }
 
-/* Shannon entropy from probabilities */
+/* Shannon entropy from probabilities (with epsilon clamp). */
 double entropy_from_probs(const double *p, int n) {
+    const double EPS = 1e-12;
+    const double LOG2 = 0.69314718055994530942; /* log(2) */
     double H = 0.0;
     for (int i = 0; i < n; i++) {
-        if (p[i] <= 0.0) continue;
-        H -= p[i] * (log(p[i]) / log(2.0));
+        double pi = p[i];
+        if (pi <= 0.0) continue;
+        if (pi < EPS) pi = EPS;
+        H -= pi * (log(pi) / LOG2);
     }
     return H;
 }
@@ -247,8 +316,8 @@ double entropy_from_probs(const double *p, int n) {
 void analyze_host_ipid(host_data_t *h) {
     if (h->count < ALERT_MIN_PACKETS) return;
 
-    double std_ipid = compute_std_diff_us(h->ip_ids, h->count);
-    double std_time = compute_std_diff_double(h->times, h->count);
+    double std_ipid = compute_std_diff_us_host(h);
+    double std_time = compute_std_diff_time_host(h);
 
     if (std_ipid > STD_IPID_THRESHOLD || std_time < STD_TIME_THRESHOLD) {
         printf("[ALERT] IPID/timing anomaly from %s\n", h->src_ip);
@@ -261,12 +330,12 @@ void analyze_host_ipid(host_data_t *h) {
 void analyze_host_ts(host_data_t *h) {
     if (h->ts_count < ALERT_MIN_TS_SAMPLES) return;
 
-    double std_tsval = compute_std_diff_ui(h->tsvals, h->ts_count);
+    double std_tsval = compute_std_diff_ts_host(h);
 
-    int total_lsb = h->ts_lsb_ones + h->ts_lsb_zeros;
+    int total_lsb = h->ts_lsb_ones_window + h->ts_lsb_zeros_window;
     double p1 = 0.0;
     if (total_lsb > 0) {
-        p1 = (double)h->ts_lsb_ones / (double)total_lsb;
+        p1 = (double)h->ts_lsb_ones_window / (double)total_lsb;
     }
 
     int suspicious = 0;
@@ -274,7 +343,7 @@ void analyze_host_ts(host_data_t *h) {
     if (fabs(p1 - 0.5) > (LSB_BIAS_THRESHOLD - 0.5)) suspicious = 1;
 
     double acf[MAX_LAG + 1];
-    compute_acf_ui(h->tsvals, h->ts_count, MAX_LAG, acf);
+    compute_acf_ts_host(h, MAX_LAG, acf);
 
     double max_abs_acf = 0.0;
     int max_k = 0;
@@ -494,8 +563,9 @@ void analyze_timing_entropy_cce_chi(host_data_t *h) {
     double ipd[WINDOW_SIZE - 1];
     int ipd_count = 0;
 
+    /* Build IPDs from ring-buffered times. */
     for (int i = 1; i < n_times; i++) {
-        double d = h->times[i] - h->times[i - 1];
+        double d = time_at(h, i) - time_at(h, i - 1);
         if (d <= 0.0) continue;
         ipd[ipd_count++] = d;
     }
@@ -527,7 +597,14 @@ void analyze_timing_entropy_cce_chi(host_data_t *h) {
     }
 
     double H = entropy_from_probs(hist_probs, ENTROPY_BIN_COUNT);
-    double CCE = compute_corrected_conditional_entropy(h->times, h->count);
+
+    /* Flatten times into linear array for existing CCE code. */
+    double times_lin[WINDOW_SIZE];
+    for (int i = 0; i < h->count; i++) {
+        times_lin[i] = time_at(h, i);
+    }
+    double CCE = compute_corrected_conditional_entropy(times_lin, h->count);
+
     double chisq = compute_chi_square(hist_counts, ENTROPY_BIN_COUNT, ipd_count);
 
     int suspicious = 0;
@@ -585,18 +662,77 @@ void parse_tcp_options_and_tsval(const struct tcphdr *tcph,
     }
 }
 
-/* Packet handler */
+/* Packet handler with link-layer type handling and safety checks */
 void packet_handler(u_char *user, const struct pcap_pkthdr *hdr,
                     const u_char *packet) {
     (void)user;
 
-    if (hdr->caplen < 14 + (int)sizeof(struct ip)) return;
-    const struct ip *iph = (const struct ip *)(packet + 14);
+    if (hdr->caplen < g_l2_len) return;
+
+    int l2_len = g_l2_len;
+    uint16_t ether_type = 0;
+
+    switch (g_datalink_type) {
+    case DLT_EN10MB: {
+        /* Ethernet, maybe with 802.1Q VLAN. */
+        if (hdr->caplen < 14) return;
+
+        const struct ether_header {
+            uint8_t  dst[6];
+            uint8_t  src[6];
+            uint16_t type;
+        } *eth = (const void *)packet;
+
+        ether_type = ntohs(eth->type);
+        if (ether_type == 0x8100) {
+            /* VLAN-tagged: header is 18 bytes; EtherType at offset 16. */
+            if (hdr->caplen < 18) return;
+            ether_type = ntohs(*(const uint16_t *)(packet + 16));
+            l2_len = 18;
+        } else {
+            l2_len = 14;
+        }
+
+        if (ether_type != 0x0800) return; /* only IPv4 */
+        break;
+    }
+
+    case DLT_LINUX_SLL: {
+        /* Linux cooked capture: 16-byte SLL header. */
+        if (hdr->caplen < 16) return;
+        l2_len = 16;
+        /* Protocol field is at offset 14 as big-endian; could check == ETH_P_IP.
+         * For simplicity, just assume IPv4 is most common and rely on ip_v check. */
+        break;
+    }
+
+    case DLT_NULL: {
+        /* BSD loopback: 4-byte AF_* family in host byte order. */
+        if (hdr->caplen < 4) return;
+        l2_len = 4;
+        uint32_t af;
+        memcpy(&af, packet, sizeof(af));
+        if (af != AF_INET) return; /* only IPv4 */
+        break;
+    }
+
+    default:
+        /* Should not happen; filtered in main. */
+        return;
+    }
+
+    /* IP header begins at packet + l2_len */
+    if (hdr->caplen < l2_len + (int)sizeof(struct ip)) return;
+    const struct ip *iph = (const struct ip *)(packet + l2_len);
     if (iph->ip_v != 4) return;
 
     int ip_hdr_len = iph->ip_hl * 4;
     if (ip_hdr_len < (int)sizeof(struct ip)) return;
-    if (hdr->caplen < 14 + ip_hdr_len) return;
+    if (hdr->caplen < l2_len + ip_hdr_len) return;
+
+    uint16_t ip_total_len = ntohs(iph->ip_len);
+    if (ip_total_len < ip_hdr_len) return;
+    if (hdr->caplen < l2_len + ip_total_len) return;
 
     char src_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(iph->ip_src), src_ip, sizeof(src_ip));
@@ -616,9 +752,10 @@ void packet_handler(u_char *user, const struct pcap_pkthdr *hdr,
     const u_char *tcp_start = (const u_char *)iph + ip_hdr_len;
     if (hdr->caplen < (tcp_start - packet) + (int)sizeof(struct tcphdr)) return;
 
-    const struct tcphdr *tcph = (const struct tcphdr *)tcp_start;
-    int tcp_len = ntohs(iph->ip_len) - ip_hdr_len;
+    int tcp_len = ip_total_len - ip_hdr_len;
     if (tcp_len < (int)sizeof(struct tcphdr)) return;
+
+    const struct tcphdr *tcph = (const struct tcphdr *)tcp_start;
 
     unsigned int tsval;
     int has_ts;
@@ -645,13 +782,32 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("Oneida Network Steganography Detector\n");
+    printf("Oneida Network Steganography Detector (updated)\n");
     printf("Author: Max Gecse\n");
     printf("Using device: %s\n", dev);
 
     handle = pcap_open_live(dev, 65535, 1, 1000, errbuf);
     if (handle == NULL) {
         fprintf(stderr, "Couldn't open device %s: %s\n", dev, errbuf);
+        return 1;
+    }
+
+    /* Determine link-layer header type and base L2 length. */
+    g_datalink_type = pcap_datalink(handle);
+
+    switch (g_datalink_type) {
+    case DLT_EN10MB:
+        g_l2_len = 14;
+        break;
+    case DLT_LINUX_SLL:
+        g_l2_len = 16;
+        break;
+    case DLT_NULL:
+        g_l2_len = 4;
+        break;
+    default:
+        fprintf(stderr, "Unsupported link-layer type: %d\n", g_datalink_type);
+        pcap_close(handle);
         return 1;
     }
 
@@ -693,4 +849,3 @@ int main(int argc, char *argv[]) {
     pcap_close(handle);
     return 0;
 }
-
