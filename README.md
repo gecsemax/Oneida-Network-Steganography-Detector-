@@ -1,7 +1,8 @@
 ```markdown
 # Oneida Network Steganography Detector
 
-Oneida is a heuristic detector for network steganography and covert channels over IPv4/TCP. It focuses on subtle anomalies in IPID behavior, TCP timestamps, and inter‑packet timing.
+Oneida is a heuristic detector for network steganography and covert channels over IPv4/TCP.
+It focuses on subtle anomalies in IPID behavior, TCP timestamps, and inter‑packet timing.
 
 > Status: Experimental research tool, not a production IDS.
 
