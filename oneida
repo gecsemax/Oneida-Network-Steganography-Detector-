@@ -1,0 +1,1144 @@
+/*
+ * Oneida Network Steganography Detector (Linux, multithreaded)
+ *
+ * Author: Max Gecse
+ *
+ * Features:
+ *   - Per-flow (5-tuple) ring buffers
+ *   - IP ID + timing variance (with wrap-around handling)
+ *   - TCP timestamp (TSval) statistics, LSB bias, autocorrelation
+ *   - Timing entropy and corrected conditional entropy (CCE)
+ *   - Chi-square goodness-of-fit on IPD histogram
+ *   - Monotonic time base for IPD
+ *   - Live and offline (pcap file) capture
+ *   - Multiple live interfaces with one pcap_loop per interface thread[web:47]
+ *   - Shared worker pool using pthreads and a job queue[web:62][web:63]
+ */
+
+#define _GNU_SOURCE
+#include <pcap.h>
+#include <pcap/dlt.h>
+#include <pcap/sll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <arpa/inet.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <errno.h>
+#include <pthread.h>
+
+/* General parameters */
+#define WINDOW_SIZE             200
+#define MAX_FLOWS               2048
+#define MAX_INTERFACES          8
+
+#define STD_IPID_THRESHOLD      500.0
+#define STD_TIME_THRESHOLD      0.05
+#define ALERT_MIN_PACKETS       30
+
+/* TCP timestamp analysis */
+#define ALERT_MIN_TS_SAMPLES    60
+#define STD_TSVAL_THRESHOLD     5000.0
+#define LSB_BIAS_THRESHOLD      0.75
+
+/* Autocorrelation settings */
+#define MAX_LAG                 20
+#define ACF_THRESHOLD           0.4
+
+/* Entropy / CCE parameters (timing) */
+#define ENTROPY_BIN_COUNT       20
+#define ENTROPY_MIN_SAMPLES     60
+#define ENTROPY_LOW_THRESHOLD   2.5
+
+#define CCE_MAX_PATTERN_LEN     3
+#define CCE_BIN_COUNT           10
+#define CCE_MIN_IPD_SAMPLES     80
+#define CCE_LOW_THRESHOLD       1.5
+
+/* Chi-square config */
+#define CHI_BIN_COUNT           ENTROPY_BIN_COUNT
+#define CHI_MIN_EXPECTED_COUNT  5.0
+#define CHI_SIG_THRESHOLD       30.0
+
+/* Flow expiry */
+#define FLOW_IDLE_TIMEOUT_SECS  600.0
+
+/* Job queue / threading */
+#define MAX_PACKET_SIZE         65535
+#define JOB_QUEUE_CAPACITY      4096
+#define NUM_WORKERS             4
+
+/* Baseline IPD distribution; replace with learned baseline if desired. */
+static double ipd_expected_prob[CHI_BIN_COUNT] = {
+    0.05, 0.05, 0.05, 0.05, 0.05,
+    0.10, 0.10, 0.15, 0.20, 0.20
+};
+
+/* Global link-layer info (set per handle in capture threads). */
+static int g_datalink_type = DLT_EN10MB;
+static int g_l2_len        = 14;
+
+/* Flow key */
+typedef struct {
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint8_t  proto;
+} flow_key_t;
+
+/* Per-flow sliding-window data (ring buffers). */
+typedef struct {
+    int in_use;
+    flow_key_t key;
+    char src_ip[INET_ADDRSTRLEN];
+    char dst_ip[INET_ADDRSTRLEN];
+
+    unsigned short ip_ids[WINDOW_SIZE];
+    double times[WINDOW_SIZE];
+    int count;
+    int ip_index;
+
+    unsigned int tsvals[WINDOW_SIZE];
+    int ts_count;
+    int ts_index;
+
+    unsigned char ts_lsb_bits[WINDOW_SIZE];
+    int ts_lsb_ones_window;
+    int ts_lsb_zeros_window;
+
+    int ts_lsb_ones;
+    int ts_lsb_zeros;
+
+    double last_seen;
+} host_data_t;
+
+static host_data_t flows[MAX_FLOWS];
+
+/* Multiple interfaces */
+typedef struct {
+    pcap_t *handle;
+    char    name[64];
+} iface_handle_t;
+
+static iface_handle_t g_ifaces[MAX_INTERFACES];
+static int g_iface_count = 0;
+
+/* Job queue */
+
+typedef struct {
+    struct pcap_pkthdr hdr;
+    uint8_t            data[MAX_PACKET_SIZE];
+} packet_job_t;
+
+typedef struct {
+    packet_job_t jobs[JOB_QUEUE_CAPACITY];
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t mtx;
+    pthread_cond_t  not_empty;
+    pthread_cond_t  not_full;
+    int stop;
+} job_queue_t;
+
+static job_queue_t g_queue;
+
+static volatile int g_stop = 0;
+
+/* Time helper: monotonic seconds */
+double now_secs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* Flow key equality */
+static int flow_key_equal(const flow_key_t *a, const flow_key_t *b) {
+    return a->src_ip == b->src_ip &&
+           a->dst_ip == b->dst_ip &&
+           a->src_port == b->src_port &&
+           a->dst_port == b->dst_port &&
+           a->proto   == b->proto;
+}
+
+/* Flow table lookup / create */
+host_data_t* get_flow(const flow_key_t *key,
+                      const char *src_ip,
+                      const char *dst_ip,
+                      double t_now) {
+    int free_idx = -1;
+    for (int i = 0; i < MAX_FLOWS; i++) {
+        if (!flows[i].in_use) {
+            if (free_idx == -1) free_idx = i;
+            continue;
+        }
+        if (flow_key_equal(&flows[i].key, key)) {
+            flows[i].last_seen = t_now;
+            return &flows[i];
+        }
+    }
+    if (free_idx == -1) return NULL;
+    host_data_t *h = &flows[free_idx];
+    memset(h, 0, sizeof(*h));
+    h->in_use = 1;
+    h->key = *key;
+    strncpy(h->src_ip, src_ip, sizeof(h->src_ip)-1);
+    strncpy(h->dst_ip, dst_ip, sizeof(h->dst_ip)-1);
+    h->last_seen = t_now;
+    return h;
+}
+
+/* Flow expiry */
+void expire_flows(double t_now) {
+    for (int i = 0; i < MAX_FLOWS; i++) {
+        if (!flows[i].in_use) continue;
+        if (t_now - flows[i].last_seen > FLOW_IDLE_TIMEOUT_SECS) {
+            flows[i].in_use = 0;
+        }
+    }
+}
+
+/* IP ID wrap-around aware delta (16-bit ring). */
+static inline double ipid_delta(unsigned short a, unsigned short b) {
+    int diff = (int)a - (int)b;
+    if (diff > 32767)  diff -= 65536;
+    if (diff < -32768) diff += 65536;
+    return (double)diff;
+}
+
+/* Ring-buffer helpers: logical index 0 = oldest, count-1 = newest. */
+static inline unsigned short ipid_at(const host_data_t *h, int i) {
+    int idx = (h->ip_index + WINDOW_SIZE - h->count + i) % WINDOW_SIZE;
+    return h->ip_ids[idx];
+}
+
+static inline double time_at(const host_data_t *h, int i) {
+    int idx = (h->ip_index + WINDOW_SIZE - h->count + i) % WINDOW_SIZE;
+    return h->times[idx];
+}
+
+static inline unsigned int tsval_at(const host_data_t *h, int i) {
+    int idx = (h->ts_index + WINDOW_SIZE - h->ts_count + i) % WINDOW_SIZE;
+    return h->tsvals[idx];
+}
+
+/* Sliding window add for IPID+time (ring buffer). */
+void add_sample_ipid(host_data_t *h, unsigned short ip_id, double t) {
+    if (h->count < WINDOW_SIZE) {
+        h->count++;
+    }
+    h->ip_ids[h->ip_index] = ip_id;
+    h->times[h->ip_index]  = t;
+    h->ip_index = (h->ip_index + 1) % WINDOW_SIZE;
+}
+
+/* Sliding window add for TSval + per-window LSB counts (ring buffer). */
+void add_sample_tsval(host_data_t *h, unsigned int tsval) {
+    if (tsval & 1U) h->ts_lsb_ones++;
+    else            h->ts_lsb_zeros++;
+
+    unsigned char new_bit = (tsval & 1U) ? 1U : 0U;
+
+    if (h->ts_count < WINDOW_SIZE) {
+        h->tsvals[h->ts_index] = tsval;
+        h->ts_lsb_bits[h->ts_index] = new_bit;
+        if (new_bit) h->ts_lsb_ones_window++;
+        else         h->ts_lsb_zeros_window++;
+        h->ts_index = (h->ts_index + 1) % WINDOW_SIZE;
+        h->ts_count++;
+    } else {
+        unsigned char old_bit = h->ts_lsb_bits[h->ts_index];
+        if (old_bit) h->ts_lsb_ones_window--;
+        else         h->ts_lsb_zeros_window--;
+
+        h->tsvals[h->ts_index] = tsval;
+        h->ts_lsb_bits[h->ts_index] = new_bit;
+        if (new_bit) h->ts_lsb_ones_window++;
+        else         h->ts_lsb_zeros_window++;
+
+        h->ts_index = (h->ts_index + 1) % WINDOW_SIZE;
+    }
+}
+
+/* Basic stats helpers */
+
+double compute_std_diff_us_host(const host_data_t *h) {
+    int n = h->count;
+    if (n < 2) return 0.0;
+
+    double sum = 0.0, mean, var = 0.0;
+    for (int i = 1; i < n; i++) {
+        unsigned short prev = ipid_at(h, i - 1);
+        unsigned short curr = ipid_at(h, i);
+        double d = ipid_delta(curr, prev);
+        sum += d;
+    }
+    int m = n - 1;
+    mean = sum / m;
+
+    for (int i = 1; i < n; i++) {
+        unsigned short prev = ipid_at(h, i - 1);
+        unsigned short curr = ipid_at(h, i);
+        double d = ipid_delta(curr, prev);
+        double diff = d - mean;
+        var += diff * diff;
+    }
+    var /= m;
+    return sqrt(var);
+}
+
+double compute_std_diff_time_host(const host_data_t *h) {
+    int n = h->count;
+    if (n < 2) return 0.0;
+
+    double sum = 0.0, mean, var = 0.0;
+    for (int i = 1; i < n; i++) {
+        double d = time_at(h, i) - time_at(h, i - 1);
+        sum += d;
+    }
+    int m = n - 1;
+    mean = sum / m;
+
+    for (int i = 1; i < n; i++) {
+        double d = time_at(h, i) - time_at(h, i - 1);
+        double diff = d - mean;
+        var += diff * diff;
+    }
+    var /= m;
+    return sqrt(var);
+}
+
+double compute_std_diff_ts_host(const host_data_t *h) {
+    int n = h->ts_count;
+    if (n < 2) return 0.0;
+
+    double sum = 0.0, mean, var = 0.0;
+    for (int i = 1; i < n; i++) {
+        double d = (double)((long long)tsval_at(h, i) -
+                            (long long)tsval_at(h, i - 1));
+        sum += d;
+    }
+    int m = n - 1;
+    mean = sum / m;
+
+    for (int i = 1; i < n; i++) {
+        double d = (double)((long long)tsval_at(h, i) -
+                            (long long)tsval_at(h, i - 1));
+        double diff = d - mean;
+        var += diff * diff;
+    }
+    var /= m;
+    return sqrt(var);
+}
+
+/* Autocorrelation for TSvals */
+void compute_acf_ts_host(const host_data_t *h, int max_lag,
+                         double *acf_out) {
+    int n = h->ts_count;
+    if (n < 2) {
+        for (int k = 0; k <= max_lag; k++) acf_out[k] = 0.0;
+        return;
+    }
+
+    double mean = 0.0;
+    for (int i = 0; i < n; i++) mean += (double)tsval_at(h, i);
+    mean /= (double)n;
+
+    double denom = 0.0;
+    for (int i = 0; i < n; i++) {
+        double x = (double)tsval_at(h, i) - mean;
+        denom += x * x;
+    }
+    if (denom == 0.0) {
+        for (int k = 0; k <= max_lag; k++) acf_out[k] = 0.0;
+        return;
+    }
+
+    acf_out[0] = 1.0;
+    for (int k = 1; k <= max_lag; k++) {
+        if (k >= n) {
+            acf_out[k] = 0.0;
+            continue;
+        }
+        double num = 0.0;
+        for (int i = 0; i + k < n; i++) {
+            double x1 = (double)tsval_at(h, i) - mean;
+            double x2 = (double)tsval_at(h, i + k) - mean;
+            num += x1 * x2;
+        }
+        acf_out[k] = num / denom;
+    }
+}
+
+/* Shannon entropy */
+double entropy_from_probs(const double *p, int n) {
+    const double EPS  = 1e-12;
+    const double LOG2 = 0.69314718055994530942;
+    double H = 0.0;
+    for (int i = 0; i < n; i++) {
+        double pi = p[i];
+        if (pi <= 0.0) continue;
+        if (pi < EPS) pi = EPS;
+        H -= pi * (log(pi) / LOG2);
+    }
+    return H;
+}
+
+/* IPID + timing variance analysis */
+void analyze_host_ipid(host_data_t *h) {
+    if (h->count < ALERT_MIN_PACKETS) return;
+
+    double std_ipid = compute_std_diff_us_host(h);
+    double std_time = compute_std_diff_time_host(h);
+
+    if (std_ipid > STD_IPID_THRESHOLD || std_time < STD_TIME_THRESHOLD) {
+        printf("[ALERT] IPID/timing anomaly %s:%u -> %s:%u\n",
+               h->src_ip, ntohs(h->key.src_port),
+               h->dst_ip, ntohs(h->key.dst_port));
+        printf("        IPID std(diff): %.2f, time std(diff): %.6f\n",
+               std_ipid, std_time);
+    }
+}
+
+/* TCP timestamps analysis */
+void analyze_host_ts(host_data_t *h) {
+    if (h->ts_count < ALERT_MIN_TS_SAMPLES) return;
+
+    double std_tsval = compute_std_diff_ts_host(h);
+
+    int total_lsb = h->ts_lsb_ones_window + h->ts_lsb_zeros_window;
+    double p1 = 0.0;
+    if (total_lsb > 0) {
+        p1 = (double)h->ts_lsb_ones_window / (double)total_lsb;
+    }
+
+    int suspicious = 0;
+    if (std_tsval > STD_TSVAL_THRESHOLD) suspicious = 1;
+    if (fabs(p1 - 0.5) > (LSB_BIAS_THRESHOLD - 0.5)) suspicious = 1;
+
+    double acf[MAX_LAG + 1];
+    compute_acf_ts_host(h, MAX_LAG, acf);
+
+    double max_abs_acf = 0.0;
+    int max_k = 0;
+    for (int k = 1; k <= MAX_LAG; k++) {
+        double a = fabs(acf[k]);
+        if (a > max_abs_acf) {
+            max_abs_acf = a;
+            max_k = k;
+        }
+    }
+
+    if (max_abs_acf > ACF_THRESHOLD) {
+        suspicious = 1;
+        printf("[ALERT] TSval autocorrelation anomaly %s:%u -> %s:%u\n",
+               h->src_ip, ntohs(h->key.src_port),
+               h->dst_ip, ntohs(h->key.dst_port));
+        printf("        max |R(k)| at lag %d: %.3f\n", max_k, max_abs_acf);
+    }
+
+    if (suspicious) {
+        printf("[ALERT] TCP timestamp anomaly %s:%u -> %s:%u\n",
+               h->src_ip, ntohs(h->key.src_port),
+               h->dst_ip, ntohs(h->key.dst_port));
+        printf("        TSval std(diff): %.2f, LSB(1) fraction: %.3f\n",
+               std_tsval, p1);
+    }
+}
+
+/* ---- CCE helpers ---- */
+
+int build_ipd_symbols(const double *times, int n_times,
+                      unsigned char *sym_out, int max_sym) {
+    if (n_times < 2) return 0;
+
+    double ipd[WINDOW_SIZE - 1];
+    int ipd_count = 0;
+    for (int i = 1; i < n_times && ipd_count < max_sym; i++) {
+        double d = times[i] - times[i - 1];
+        if (d <= 0.0) continue;
+        ipd[ipd_count++] = d;
+    }
+    if (ipd_count < 2) return 0;
+
+    double min_d = ipd[0], max_d = ipd[0];
+    for (int i = 1; i < ipd_count; i++) {
+        if (ipd[i] < min_d) min_d = ipd[i];
+        if (ipd[i] > max_d) max_d = ipd[i];
+    }
+    if (max_d <= min_d) return 0;
+
+    for (int i = 0; i < ipd_count; i++) {
+        double norm = (ipd[i] - min_d) / (max_d - min_d);
+        int bin = (int)(norm * CCE_BIN_COUNT);
+        if (bin >= CCE_BIN_COUNT) bin = CCE_BIN_COUNT - 1;
+        if (bin < 0) bin = 0;
+        sym_out[i] = (unsigned char)bin;
+    }
+    return ipd_count;
+}
+
+double compute_cce_for_m(const unsigned char *sym, int n_sym, int m) {
+    if (m < 1 || n_sym < m + 1) return 0.0;
+
+    typedef struct {
+        unsigned char pat[CCE_MAX_PATTERN_LEN];
+        int count;
+    } pat_entry_t;
+    typedef struct {
+        unsigned char pat[CCE_MAX_PATTERN_LEN - 1];
+        int count;
+    } prefix_entry_t;
+
+    pat_entry_t patterns[2048];
+    int pat_used = 0;
+    prefix_entry_t prefixes[2048];
+    int pre_used = 0;
+
+    int total_patterns = 0;
+    int unique_patterns = 0;
+
+    for (int i = 0; i + m <= n_sym; i++) {
+        const unsigned char *p = &sym[i];
+        const unsigned char *prefix = &sym[i];
+
+        int idx = -1;
+        for (int j = 0; j < pat_used; j++) {
+            int same = 1;
+            for (int k = 0; k < m; k++) {
+                if (patterns[j].pat[k] != p[k]) { same = 0; break; }
+            }
+            if (same) { idx = j; break; }
+        }
+        if (idx == -1) {
+            if (pat_used >= (int)(sizeof(patterns)/sizeof(patterns[0]))) break;
+            idx = pat_used++;
+            memcpy(patterns[idx].pat, p, m);
+            patterns[idx].count = 0;
+            unique_patterns++;
+        }
+        patterns[idx].count++;
+        total_patterns++;
+
+        if (m > 1) {
+            int pre_idx = -1;
+            for (int j = 0; j < pre_used; j++) {
+                int same = 1;
+                for (int k = 0; k < m - 1; k++) {
+                    if (prefixes[j].pat[k] != prefix[k]) { same = 0; break; }
+                }
+                if (same) { pre_idx = j; break; }
+            }
+            if (pre_idx == -1) {
+                if (pre_used >= (int)(sizeof(prefixes)/sizeof(prefixes[0]))) break;
+                pre_idx = pre_used++;
+                memcpy(prefixes[pre_idx].pat, prefix, m - 1);
+                prefixes[pre_idx].count = 0;
+            }
+            prefixes[pre_idx].count++;
+        }
+    }
+
+    if (total_patterns == 0) return 0.0;
+
+    double CE = 0.0;
+    if (m == 1) {
+        double probs[2048];
+        for (int i = 0; i < pat_used; i++) {
+            probs[i] = (double)patterns[i].count / (double)total_patterns;
+        }
+        CE = entropy_from_probs(probs, pat_used);
+    } else {
+        for (int pi = 0; pi < pre_used; pi++) {
+            int prefix_count = prefixes[pi].count;
+            if (prefix_count == 0) continue;
+
+            int sym_counts[CCE_BIN_COUNT];
+            memset(sym_counts, 0, sizeof(sym_counts));
+            int total_suffix = 0;
+
+            for (int i = 0; i < pat_used; i++) {
+                int same = 1;
+                for (int k = 0; k < m - 1; k++) {
+                    if (patterns[i].pat[k] != prefixes[pi].pat[k]) { same = 0; break; }
+                }
+                if (!same) continue;
+                unsigned char last = patterns[i].pat[m - 1];
+                if (last >= CCE_BIN_COUNT) continue;
+                sym_counts[last] += patterns[i].count;
+                total_suffix += patterns[i].count;
+            }
+            if (total_suffix == 0) continue;
+
+            double p_prefix = (double)prefix_count / (double)total_patterns;
+
+            double probs[CCE_BIN_COUNT];
+            for (int s = 0; s < CCE_BIN_COUNT; s++) {
+                probs[s] = (double)sym_counts[s] / (double)total_suffix;
+            }
+            double H_suffix = entropy_from_probs(probs, CCE_BIN_COUNT);
+            CE += p_prefix * H_suffix;
+        }
+    }
+
+    double perc_unique = (double)unique_patterns / (double)total_patterns;
+
+    int x1_counts[CCE_BIN_COUNT];
+    memset(x1_counts, 0, sizeof(x1_counts));
+    for (int i = 0; i < pat_used; i++) {
+        int s = patterns[i].pat[0];
+        if (s < 0 || s >= CCE_BIN_COUNT) continue;
+        x1_counts[s] += patterns[i].count;
+    }
+    double x1_probs[CCE_BIN_COUNT];
+    for (int i = 0; i < CCE_BIN_COUNT; i++) {
+        x1_probs[i] = (double)x1_counts[i] / (double)total_patterns;
+    }
+    double EN_X1 = entropy_from_probs(x1_probs, CCE_BIN_COUNT);
+
+    double CCE = CE + perc_unique * EN_X1;
+    return CCE;
+}
+
+double compute_corrected_conditional_entropy(const double *times, int n_times) {
+    unsigned char sym[WINDOW_SIZE];
+    int n_sym = build_ipd_symbols(times, n_times, sym, WINDOW_SIZE);
+    if (n_sym < CCE_MIN_IPD_SAMPLES) return 0.0;
+
+    double min_cce = 1e9;
+    for (int m = 1; m <= CCE_MAX_PATTERN_LEN; m++) {
+        double cce = compute_cce_for_m(sym, n_sym, m);
+        if (cce > 0.0 && cce < min_cce) {
+            min_cce = cce;
+        }
+    }
+    if (min_cce == 1e9) min_cce = 0.0;
+    return min_cce;
+}
+
+/* Chi-square */
+double compute_chi_square(const int *obs_counts, int bin_count, int total_obs) {
+    if (total_obs <= 0) return 0.0;
+
+    double chisq = 0.0;
+    for (int i = 0; i < bin_count; i++) {
+        double expected = ipd_expected_prob[i] * (double)total_obs;
+        if (expected < CHI_MIN_EXPECTED_COUNT) continue;
+        double diff = (double)obs_counts[i] - expected;
+        chisq += (diff * diff) / expected;
+    }
+    return chisq;
+}
+
+/* Combined timing entropy + CCE + chi-square analysis */
+void analyze_timing_entropy_cce_chi(host_data_t *h) {
+    if (h->count < CCE_MIN_IPD_SAMPLES) return;
+
+    int n_times = h->count;
+    double ipd[WINDOW_SIZE - 1];
+    int ipd_count = 0;
+
+    for (int i = 1; i < n_times; i++) {
+        double d = time_at(h, i) - time_at(h, i - 1);
+        if (d <= 0.0) continue;
+        ipd[ipd_count++] = d;
+    }
+    if (ipd_count < CCE_MIN_IPD_SAMPLES) return;
+
+    double min_d = ipd[0], max_d = ipd[0];
+    for (int i = 1; i < ipd_count; i++) {
+        if (ipd[i] < min_d) min_d = ipd[i];
+        if (ipd[i] > max_d) max_d = ipd[i];
+    }
+    if (max_d <= min_d) return;
+
+    int hist_counts[ENTROPY_BIN_COUNT];
+    memset(hist_counts, 0, sizeof(hist_counts));
+
+    double hist_probs[ENTROPY_BIN_COUNT];
+    memset(hist_probs, 0, sizeof(hist_probs));
+
+    for (int i = 0; i < ipd_count; i++) {
+        double norm = (ipd[i] - min_d) / (max_d - min_d);
+        int bin = (int)(norm * ENTROPY_BIN_COUNT);
+        if (bin >= ENTROPY_BIN_COUNT) bin = ENTROPY_BIN_COUNT - 1;
+        if (bin < 0) bin = 0;
+        hist_counts[bin] += 1;
+        hist_probs[bin] += 1.0;
+    }
+    for (int i = 0; i < ENTROPY_BIN_COUNT; i++) {
+        hist_probs[i] /= (double)ipd_count;
+    }
+
+    double H = entropy_from_probs(hist_probs, ENTROPY_BIN_COUNT);
+
+    double times_lin[WINDOW_SIZE];
+    for (int i = 0; i < h->count; i++) {
+        times_lin[i] = time_at(h, i);
+    }
+    double CCE = compute_corrected_conditional_entropy(times_lin, h->count);
+
+    double chisq = compute_chi_square(hist_counts, ENTROPY_BIN_COUNT, ipd_count);
+
+    int suspicious = 0;
+    if (H < ENTROPY_LOW_THRESHOLD) suspicious = 1;
+    if (CCE > 0.0 && CCE < CCE_LOW_THRESHOLD) suspicious = 1;
+    if (chisq > CHI_SIG_THRESHOLD) suspicious = 1;
+
+    if (suspicious) {
+        printf("[ALERT] Timing anomaly (entropy/CCE/chi-square) %s:%u -> %s:%u\n",
+               h->src_ip, ntohs(h->key.src_port),
+               h->dst_ip, ntohs(h->key.dst_port));
+        printf("        H: %.3f bits, CCE: %.3f bits, chi^2: %.2f\n",
+               H, CCE, chisq);
+    }
+}
+
+/* Parse TCP options to extract TSval if present */
+void parse_tcp_options_and_tsval(const struct tcphdr *tcph,
+                                 const u_char *tcp_start,
+                                 int tcp_len,
+                                 unsigned int *tsval_out,
+                                 int *has_ts) {
+    *has_ts = 0;
+    *tsval_out = 0;
+
+    int hdr_len = tcph->doff * 4;
+    if (hdr_len <= (int)sizeof(struct tcphdr) || hdr_len > tcp_len) return;
+
+    int opt_len = hdr_len - (int)sizeof(struct tcphdr);
+    const u_char *opt_ptr = tcp_start + sizeof(struct tcphdr);
+    int i = 0;
+
+    while (i < opt_len) {
+        uint8_t kind = opt_ptr[i];
+        if (kind == 0) break;
+        else if (kind == 1) {
+            i += 1;
+            continue;
+        } else {
+            if (i + 1 >= opt_len) break;
+            uint8_t len = opt_ptr[i + 1];
+            if (len < 2 || i + len > opt_len) break;
+
+            if (kind == 8 && len == 10) {
+                if (i + 10 <= opt_len) {
+                    const u_char *p = &opt_ptr[i + 2];
+                    unsigned int tsval;
+                    memcpy(&tsval, p, sizeof(unsigned int));
+                    tsval = ntohl(tsval);
+                    *tsval_out = tsval;
+                    *has_ts = 1;
+                }
+            }
+            i += len;
+        }
+    }
+}
+
+/* Job queue implementation */
+
+int queue_push(job_queue_t *q, const struct pcap_pkthdr *hdr,
+               const u_char *packet) {
+    pthread_mutex_lock(&q->mtx);
+    while (!q->stop && q->count == JOB_QUEUE_CAPACITY) {
+        pthread_cond_wait(&q->not_full, &q->mtx);
+    }
+    if (q->stop) {
+        pthread_mutex_unlock(&q->mtx);
+        return -1;
+    }
+    packet_job_t *job = &q->jobs[q->tail];
+    job->hdr = *hdr;
+    if (job->hdr.caplen > MAX_PACKET_SIZE)
+        job->hdr.caplen = MAX_PACKET_SIZE;
+    memcpy(job->data, packet, job->hdr.caplen);
+    q->tail = (q->tail + 1) % JOB_QUEUE_CAPACITY;
+    q->count++;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mtx);
+    return 0;
+}
+
+int queue_pop(job_queue_t *q, packet_job_t *out) {
+    pthread_mutex_lock(&q->mtx);
+    while (!q->stop && q->count == 0) {
+        pthread_cond_wait(&q->not_empty, &q->mtx);
+    }
+    if (q->stop && q->count == 0) {
+        pthread_mutex_unlock(&q->mtx);
+        return -1;
+    }
+    *out = q->jobs[q->head];
+    q->head = (q->head + 1) % JOB_QUEUE_CAPACITY;
+    q->count--;
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->mtx);
+    return 0;
+}
+
+/* Analysis function: uses original packet_handler logic */
+void analyze_packet(const struct pcap_pkthdr *hdr, const u_char *packet) {
+    if (hdr->caplen < (bpf_u_int32)g_l2_len) return;
+
+    int l2_len = g_l2_len;
+
+    switch (g_datalink_type) {
+    case DLT_EN10MB: {
+        if (hdr->caplen < 14) return;
+        struct ether_header {
+            uint8_t  dst[6];
+            uint8_t  src[6];
+            uint16_t type;
+        } __attribute__((packed));
+        const struct ether_header *eth = (const void *)packet;
+        uint16_t ether_type = ntohs(eth->type);
+        if (ether_type == 0x8100) {
+            if (hdr->caplen < 18) return;
+            ether_type = ntohs(*(const uint16_t *)(packet + 16));
+            l2_len = 18;
+        } else {
+            l2_len = 14;
+        }
+        if (ether_type != 0x0800) return;
+        break;
+    }
+    case DLT_LINUX_SLL: {
+        if (hdr->caplen < SLL_HDR_LEN) return;
+        const struct sll_header *sll = (const void *)packet;
+        uint16_t proto = ntohs(sll->sll_protocol);
+        if (proto != 0x0800) return;
+        l2_len = SLL_HDR_LEN;
+        break;
+    }
+#ifdef DLT_LINUX_SLL2
+    case DLT_LINUX_SLL2: {
+        if (hdr->caplen < SLL2_HDR_LEN) return;
+        const struct sll2_header *sll2 = (const void *)packet;
+        uint16_t proto = ntohs(sll2->sll2_protocol);
+        if (proto != 0x0800) return;
+        l2_len = SLL2_HDR_LEN;
+        break;
+    }
+#endif
+    case DLT_NULL: {
+        if (hdr->caplen < 4) return;
+        uint32_t af;
+        memcpy(&af, packet, sizeof(af));
+        if (af != AF_INET) return;
+        l2_len = 4;
+        break;
+    }
+    default:
+        return;
+    }
+
+    if (hdr->caplen < l2_len + (int)sizeof(struct ip)) return;
+    const struct ip *iph = (const struct ip *)(packet + l2_len);
+    if (iph->ip_v != 4) return;
+
+    int ip_hdr_len = iph->ip_hl * 4;
+    if (ip_hdr_len < (int)sizeof(struct ip)) return;
+    if (hdr->caplen < l2_len + ip_hdr_len) return;
+
+    uint16_t ip_total_len = ntohs(iph->ip_len);
+    if (ip_total_len < ip_hdr_len) return;
+    if (hdr->caplen < l2_len + ip_total_len)
+        ip_total_len = hdr->caplen - l2_len;
+
+    char src_ip[INET_ADDRSTRLEN];
+    char dst_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(iph->ip_src), src_ip, sizeof(src_ip));
+    inet_ntop(AF_INET, &(iph->ip_dst), dst_ip, sizeof(dst_ip));
+
+    double t = now_secs();
+    unsigned short ip_id = ntohs(iph->ip_id);
+
+    flow_key_t key;
+    memset(&key, 0, sizeof(key));
+    key.src_ip  = iph->ip_src.s_addr;
+    key.dst_ip  = iph->ip_dst.s_addr;
+    key.proto   = iph->ip_p;
+
+    const u_char *tcp_start = NULL;
+    const struct tcphdr *tcph = NULL;
+
+    if (iph->ip_p == IPPROTO_TCP) {
+        tcp_start = (const u_char *)iph + ip_hdr_len;
+        if (hdr->caplen < (tcp_start - packet) + (int)sizeof(struct tcphdr))
+            return;
+
+        int tcp_len = ip_total_len - ip_hdr_len;
+        int tcp_bytes_avail = hdr->caplen - (int)(tcp_start - packet);
+        if (tcp_len > tcp_bytes_avail) tcp_len = tcp_bytes_avail;
+        if (tcp_len < (int)sizeof(struct tcphdr)) return;
+
+        tcph = (const struct tcphdr *)tcp_start;
+        key.src_port = tcph->source;
+        key.dst_port = tcph->dest;
+    }
+
+    host_data_t *h = get_flow(&key, src_ip, dst_ip, t);
+    if (!h) return;
+
+    add_sample_ipid(h, ip_id, t);
+    analyze_host_ipid(h);
+    analyze_timing_entropy_cce_chi(h);
+
+    if (iph->ip_p != IPPROTO_TCP) return;
+
+    unsigned int tsval;
+    int has_ts;
+    parse_tcp_options_and_tsval(tcph, tcp_start,
+                                ip_total_len - ip_hdr_len,
+                                &tsval, &has_ts);
+    if (has_ts) {
+        add_sample_tsval(h, tsval);
+        analyze_host_ts(h);
+    }
+
+    static int packet_counter = 0;
+    packet_counter++;
+    if ((packet_counter & 0x3FFF) == 0) {
+        expire_flows(t);
+    }
+}
+
+/* Capture callback: just enqueue */
+void capture_callback(u_char *user,
+                      const struct pcap_pkthdr *hdr,
+                      const u_char *packet) {
+    (void)user;
+    if (g_stop) return;
+    queue_push(&g_queue, hdr, packet);
+}
+
+/* Capture thread context */
+typedef struct {
+    int idx;
+} capture_arg_t;
+
+void *capture_thread_func(void *arg) {
+    capture_arg_t *carg = (capture_arg_t *)arg;
+    int idx = carg->idx;
+    pcap_t *handle = g_ifaces[idx].handle;
+
+    /* Set global L2 type for analysis based on this handle. */
+    g_datalink_type = pcap_datalink(handle);
+    switch (g_datalink_type) {
+    case DLT_EN10MB:    g_l2_len = 14;        break;
+    case DLT_LINUX_SLL: g_l2_len = SLL_HDR_LEN; break;
+#ifdef DLT_LINUX_SLL2
+    case DLT_LINUX_SLL2:g_l2_len = SLL2_HDR_LEN; break;
+#endif
+    case DLT_NULL:      g_l2_len = 4;         break;
+    default:            g_l2_len = 14;        break;
+    }
+
+    int rc = pcap_loop(handle, -1, capture_callback, NULL);
+    if (!g_stop && rc == -1) {
+        fprintf(stderr, "Error in pcap_loop(%s): %s\n",
+                g_ifaces[idx].name, pcap_geterr(handle));
+    }
+    return NULL;
+}
+
+/* Worker threads: dequeue and analyze */
+void *worker_thread_func(void *arg) {
+    (void)arg;
+    packet_job_t job;
+    while (!g_stop) {
+        if (queue_pop(&g_queue, &job) != 0) break;
+        analyze_packet(&job.hdr, job.data);
+    }
+    return NULL;
+}
+
+/* CLI usage */
+void usage(const char *prog) {
+    fprintf(stderr,
+            "Usage: %s [-i iface]... [pcap_file]\n"
+            "  If one or more -i are given, capture live from them.\n"
+            "  If no -i and last arg is a readable file, read offline.\n",
+            prog);
+}
+
+int main(int argc, char *argv[]) {
+    char errbuf[PCAP_ERRBUF_SIZE];
+    int opt;
+    char *pcap_file = NULL;
+
+    memset(flows, 0, sizeof(flows));
+    memset(&g_queue, 0, sizeof(g_queue));
+    pthread_mutex_init(&g_queue.mtx, NULL);
+    pthread_cond_init(&g_queue.not_empty, NULL);
+    pthread_cond_init(&g_queue.not_full, NULL);
+
+    /* Parse -i interfaces, optional pcap file */
+    while ((opt = getopt(argc, argv, "i:")) != -1) {
+        switch (opt) {
+        case 'i':
+            if (g_iface_count >= MAX_INTERFACES) {
+                fprintf(stderr, "Too many interfaces (max %d)\n",
+                        MAX_INTERFACES);
+                return 1;
+            }
+            strncpy(g_ifaces[g_iface_count].name, optarg,
+                    sizeof(g_ifaces[g_iface_count].name)-1);
+            g_iface_count++;
+            break;
+        default:
+            usage(argv[0]);
+            return 1;
+        }
+    }
+
+    /* Check for pcap file if no interfaces */
+    if (g_iface_count == 0 && optind < argc) {
+        pcap_file = argv[optind];
+        if (access(pcap_file, R_OK) != 0) {
+            fprintf(stderr, "Cannot read pcap file %s\n", pcap_file);
+            return 1;
+        }
+    }
+
+    if (g_iface_count == 0 && !pcap_file) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    if (pcap_file) {
+        /* Offline mode: single handle, no separate capture thread needed. */
+        pcap_t *handle = pcap_open_offline(pcap_file, errbuf);
+        if (!handle) {
+            fprintf(stderr, "Couldn't open pcap file %s: %s\n",
+                    pcap_file, errbuf);
+            return 1;
+        }
+        printf("Oneida Detector (offline) reading %s\n", pcap_file);
+
+        g_datalink_type = pcap_datalink(handle);
+        switch (g_datalink_type) {
+        case DLT_EN10MB:    g_l2_len = 14;        break;
+        case DLT_LINUX_SLL: g_l2_len = SLL_HDR_LEN; break;
+#ifdef DLT_LINUX_SLL2
+        case DLT_LINUX_SLL2:g_l2_len = SLL2_HDR_LEN; break;
+#endif
+        case DLT_NULL:      g_l2_len = 4;         break;
+        default:
+            fprintf(stderr, "Unsupported link-layer type: %d\n",
+                    g_datalink_type);
+            pcap_close(handle);
+            return 1;
+        }
+
+        struct bpf_program fp;
+        char filter_exp[] = "ip and tcp";
+        bpf_u_int32 net = 0, mask = 0;
+        if (pcap_compile(handle, &fp, filter_exp, 0, net) == -1) {
+            fprintf(stderr, "Couldn't parse filter %s: %s\n",
+                    filter_exp, pcap_geterr(handle));
+            pcap_close(handle);
+            return 1;
+        }
+        if (pcap_setfilter(handle, &fp) == -1) {
+            fprintf(stderr, "Couldn't install filter %s: %s\n",
+                    filter_exp, pcap_geterr(handle));
+            pcap_freecode(&fp);
+            pcap_close(handle);
+            return 1;
+        }
+        pcap_freecode(&fp);
+
+        /* Offline: just loop in this thread. */
+        if (pcap_loop(handle, -1, capture_callback, NULL) == -1) {
+            fprintf(stderr, "Error in pcap_loop: %s\n", pcap_geterr(handle));
+        }
+
+        pcap_close(handle);
+        return 0;
+    }
+
+    /* Live multi-interface mode */
+    printf("Oneida Network Steganography Detector (multi-iface)\n");
+
+    /* Open each interface and install filter */
+    char filter_exp[] = "ip and tcp";
+    for (int i = 0; i < g_iface_count; i++) {
+        pcap_t *h = pcap_open_live(g_ifaces[i].name, 65535, 1, 1000, errbuf);
+        if (!h) {
+            fprintf(stderr, "Couldn't open device %s: %s\n",
+                    g_ifaces[i].name, errbuf);
+            return 1;
+        }
+        g_ifaces[i].handle = h;
+
+        struct bpf_program fp;
+        bpf_u_int32 net = 0, mask = 0;
+        if (pcap_lookupnet(g_ifaces[i].name, &net, &mask, errbuf) == -1) {
+            net = 0;
+            mask = 0;
+        }
+        if (pcap_compile(h, &fp, filter_exp, 0, net) == -1) {
+            fprintf(stderr, "Couldn't parse filter %s on %s: %s\n",
+                    filter_exp, g_ifaces[i].name, pcap_geterr(h));
+            return 1;
+        }
+        if (pcap_setfilter(h, &fp) == -1) {
+            fprintf(stderr, "Couldn't install filter %s on %s: %s\n",
+                    filter_exp, g_ifaces[i].name, pcap_geterr(h));
+            pcap_freecode(&fp);
+            return 1;
+        }
+        pcap_freecode(&fp);
+    }
+
+    printf("Capturing on %d interface(s)... (Ctrl+C to stop)\n", g_iface_count);
+
+    /* Start worker threads */
+    pthread_t workers[NUM_WORKERS];
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        pthread_create(&workers[i], NULL, worker_thread_func, NULL);
+    }
+
+    /* Start capture threads (one per interface) */
+    pthread_t cap_threads[MAX_INTERFACES];
+    capture_arg_t cap_args[MAX_INTERFACES];
+    for (int i = 0; i < g_iface_count; i++) {
+        cap_args[i].idx = i;
+        pthread_create(&cap_threads[i], NULL,
+                       capture_thread_func, &cap_args[i]);
+    }
+
+    /* Wait for capture threads to finish (Ctrl+C or error) */
+    for (int i = 0; i < g_iface_count; i++) {
+        pthread_join(cap_threads[i], NULL);
+    }
+
+    /* Stop workers */
+    g_stop = 1;
+    pthread_mutex_lock(&g_queue.mtx);
+    g_queue.stop = 1;
+    pthread_cond_broadcast(&g_queue.not_empty);
+    pthread_cond_broadcast(&g_queue.not_full);
+    pthread_mutex_unlock(&g_queue.mtx);
+
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        pthread_join(workers[i], NULL);
+    }
+
+    /* Close interfaces */
+    for (int i = 0; i < g_iface_count; i++) {
+        pcap_close(g_ifaces[i].handle);
+    }
+
+    return 0;
+}
+
