@@ -24,7 +24,7 @@ It focuses on subtle anomalies in IPID behavior, TCP timestamps, and inter‑pac
   - Sliding windows keyed by 5‑tuple (src/dst IP, src/dst port, protocol)  
   - Flow idle‑timeout and cleanup  
 - Multithreaded capture and analysis  
-  - One libpcap handle + capture thread per interface (safe pattern for libpcap)[web:124][web:128]  
+  - One libpcap handle + capture thread per interface (safe pattern for libpcap)
   - Shared worker thread pool consuming from a bounded job queue  
 - Multi‑interface and offline support  
   - Capture from one or more live interfaces at once  
@@ -40,7 +40,7 @@ It focuses on subtle anomalies in IPID behavior, TCP timestamps, and inter‑pac
 ### Dependencies
 
 - C compiler (e.g., gcc or clang)
-- libpcap (development headers + library)[web:124][web:131]  
+- libpcap (development headers + library) 
 - pthreads (POSIX threads; part of glibc on Linux, provided by libc on macOS)
 - libm (math library, typically `-lm`)
 
