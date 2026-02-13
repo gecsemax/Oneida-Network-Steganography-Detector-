@@ -1,37 +1,82 @@
-```markdown
 # Oneida Network Steganography Detector
 
-Oneida is a heuristic detector for network steganography and covert channels over IPv4/TCP.
-It focuses on subtle anomalies in IPID behavior, TCP timestamps, and inter‑packet timing.
+Author: **Max Gecse**  
+License: **MIT**
 
-> Status: Experimental research tool, not a production IDS.
+Oneida is a network steganography and covert‑channel detector.  
+It began as a heuristic IPv4/TCP tool focused on subtle anomalies in IPID behavior, TCP timestamps, and inter‑packet timing, and has evolved into a multi‑protocol, multi‑channel, near real‑time detector designed for both research and production‑style experimentation.
+
+> Status: Advanced research tool with a production‑style core. Use with care in high‑security environments.
 
 ---
 
-## Features
+## What Oneida Does
 
-- IPID + timing analysis  
-  - Wrap‑around aware IPID delta variance  
-  - Inter‑arrival time variance using a monotonic clock (Linux) for stable IPDs  
-- TCP timestamp analysis  
-  - TSval increment variance and LSB bias detection  
-  - Short‑range autocorrelation on TSvals to spot structured timing patterns  
-- Timing entropy and CCE  
-  - Shannon entropy over inter‑packet delay histogram  
-  - Corrected conditional entropy (CCE) for low‑order symbol patterns in IPDs  
-  - Chi‑square goodness‑of‑fit against a baseline IPD distribution  
-- Per‑flow tracking  
-  - Sliding windows keyed by 5‑tuple (src/dst IP, src/dst port, protocol)  
-  - Flow idle‑timeout and cleanup  
-- Multithreaded capture and analysis  
-  - One libpcap handle + capture thread per interface (safe pattern for libpcap)
-  - Shared worker thread pool consuming from a bounded job queue  
-- Multi‑interface and offline support  
-  - Capture from one or more live interfaces at once  
-  - Read and analyze offline `.pcap` files  
-- Output  
-  - Human‑readable alerts on stdout  
-  - Easy to adapt to JSON/structured logging
+- **Steganography & covert‑channel detection**
+  - Aims to catch timing‑based, header‑based, and pattern‑based covert channels
+  - Focus on low‑signal, high‑subtlety anomalies rather than only obvious scans
+
+- **Protocol‑agnostic core (design)**
+  - IPv4/IPv6 aware
+  - Handles TCP/UDP and structured to be extended for QUIC, DNS, TLS metadata, and ICMP
+
+- **Multi‑channel anomaly engine**
+  - Per‑flow sliding window of packets
+  - Multiple feature “channels”, including:
+    - Inter‑packet delay (IPD) statistics
+    - Packet length patterns
+    - Protocol‑mix entropy
+    - Header/state behaviors
+
+- **Real‑time oriented**
+  - Per‑flow scoring as packets arrive
+  - Idle‑timeout and cleanup for long‑running captures
+  - Suitable as a building block for <100 ms alerting pipelines
+
+- **ML‑ready feature extraction**
+  - Computes per‑flow statistics that can be fed into:
+    - Autoencoders
+    - Isolation Forest / clustering
+    - Other unsupervised anomaly detectors
+
+- **Extensible core**
+  - Single‑file C implementation, easy to:
+    - Wrap with plugins or scripting layers
+    - Integrate with external ML pipelines
+    - Feed into visualization / forensics tools
+
+---
+
+## Original Heuristic Focus (Research Roots)
+
+- **IPID + timing analysis**
+  - Wrap‑around aware IPID delta variance
+  - Inter‑arrival time variance using a monotonic clock (on supported platforms) for stable IPDs
+
+- **TCP timestamp analysis**
+  - TSval increment variance and LSB‑bias detection
+  - Short‑range autocorrelation on TSvals to spot structured timing patterns
+
+- **Timing entropy and low‑order patterns**
+  - Shannon entropy over IPD histograms
+  - Corrected conditional entropy (CCE) for symbol patterns
+  - Chi‑square goodness‑of‑fit against baseline IPD distributions
+
+- **Per‑flow tracking**
+  - Sliding windows keyed by 5‑tuple (src/dst IP, src/dst port, protocol)
+  - Flow idle‑timeout and cleanup
+
+- **Multithread‑friendly design**
+  - Per‑packet analysis loop written to be compatible with worker‑thread/job‑queue architectures
+  - Easy to embed into a larger multi‑threaded system
+
+- **Offline and live capture (via libpcap)**
+  - Analyze `.pcap` traces
+  - Attach to live interfaces for real traffic
+
+- **Output**
+  - Human‑readable alerts on stdout
+  - Easy to adapt to JSON or structured logging for SIEM/SOC integration
 
 ---
 
@@ -39,287 +84,98 @@ It focuses on subtle anomalies in IPID behavior, TCP timestamps, and inter‑pac
 
 ### Dependencies
 
-- C compiler (e.g., gcc or clang)
-- libpcap (development headers + library) 
-- pthreads (POSIX threads; part of glibc on Linux, provided by libc on macOS)
-- libm (math library, typically `-lm`)
+- C compiler
+  - macOS: `clang` (default)  
+  - Linux: `gcc` or `clang`
+- libpcap (development headers + library)
+- pthreads (POSIX threads; part of the standard C library on macOS/Linux)
+- libm (math library, usually `-lm`)
 
-### Generic build command (Unix‑like)
+### macOS Setup
 
-If libpcap is in standard paths:
-
-```bash
-gcc -O2 -pthread -Wall -o oneida oneida.c -lpcap -lm
-```
-
-If headers/libraries are in non‑standard locations, add `-I/path/to/include` and `-L/path/to/lib`.
-
----
-
-### Linux
-
-#### Ubuntu / Debian
-
-Install dependencies:
-
-```bash
-sudo apt update
-sudo apt install build-essential libpcap-dev
-```
-
-Build:
-
-```bash
-gcc -O2 -pthread -Wall -o oneida oneida.c -lpcap -lm
-```
-
-`libpcap-dev` provides the libpcap headers and library on Debian‑based systems.[web:82][web:92]
-
-#### Fedora
-
-Install dependencies:
-
-```bash
-sudo dnf install gcc make libpcap-devel
-```
-
-Build:
-
-```bash
-gcc -O2 -pthread -Wall -o oneida oneida.c -lpcap -lm
-```
-
-`libpcap-devel` is the development subpackage containing `pcap.h` and the library.[web:93][web:85]
-
-#### CentOS / RHEL
-
-Install dependencies (examples):
-
-```bash
-sudo yum makecache
-sudo yum install gcc make libpcap-devel
-# or, on newer releases
-sudo dnf makecache
-sudo dnf install gcc make libpcap-devel
-```
-
-Build:
-
-```bash
-gcc -O2 -pthread -Wall -o oneida oneida.c -lpcap -lm
-```
-
-`libpcap-devel` is the common RPM name for libpcap development files.[web:86][web:90][web:94]
-
-#### Arch Linux / Manjaro
-
-Install dependencies:
-
-```bash
-sudo pacman -S --needed base-devel libpcap
-```
-
-Build:
-
-```bash
-gcc -O2 -pthread -Wall -o oneida oneida.c -lpcap -lm
-```
-
-The `libpcap` package on Arch provides headers and the shared library in the standard include/lib paths.[web:87][web:91]
-
----
-
-### macOS
-
-macOS ships with libpcap as part of the OS; usually only Xcode’s command‑line tools are needed.[web:109][web:118]
-
-Install tools:
-
-```bash
-xcode-select --install
-```
-
-(Optional) Install a newer libpcap with Homebrew:
+Install libpcap with Homebrew:
 
 ```bash
 brew install libpcap
 ```
 
-Build:
+Build using the provided `Makefile`:
 
 ```bash
-gcc -O2 -pthread -Wall -o oneida oneida.c -lpcap -lm
+make
 ```
 
-If Homebrew’s prefix is not on the default search path (e.g. Apple Silicon):
+This produces the `oneida` binary.
+
+### Linux Setup
+
+On Debian/Ubuntu:
 
 ```bash
-gcc -O2 -pthread -Wall \
-  -I/opt/homebrew/include -L/opt/homebrew/lib \
-  -o oneida oneida.c -lpcap -lm
+sudo apt-get update
+sudo apt-get install build-essential libpcap-dev
+make
 ```
-
-> Note: The code is primarily tuned for Linux (e.g., SLL/SLL2 link types). On macOS you may need to add `#ifdef __linux__` guards or trim Linux‑specific branches if you hit build issues.
 
 ---
 
-### Windows (Npcap)
+## Usage Examples
 
-On Windows, libpcap functionality is provided by Npcap, the modern replacement for WinPcap.[web:111][web:119][web:129]
+### Live Capture (macOS)
 
-1. Install Npcap  
-
-   - Download the installer from https://npcap.com.  
-   - Enable “WinPcap API‑compatible mode” so `pcap.h` and `wpcap.dll` are available.[web:114][web:115]
-
-2. Install a compiler / environment  
-
-   - Visual Studio (MSVC), or  
-   - MinGW‑w64 / MSYS2
-
-3. Configure include and library paths to the Npcap SDK  
-
-   - Include directory: contains `pcap.h`  
-   - Library directory: contains `wpcap.lib` and `Packet.lib`
-
-Example with MinGW‑w64 (paths may differ):
+List interfaces:
 
 ```bash
-gcc -O2 -Wall -o oneida.exe oneida.c \
-  -I"C:/Program Files/Npcap/Include" \
-  -L"C:/Program Files/Npcap/Lib" \
-  -lwpcap -lPacket -lws2_32
+ifconfig | grep -E '^[a-z]+[0-9]+:' | cut -d: -f1
 ```
 
-> Important: The current code uses POSIX threads and some Linux‑specific headers. A full Windows port requires replacing pthreads with Win32 threads or C++ `std::thread`, and adjusting includes and linking according to the Npcap developer guide.[web:119][web:111]
+Typical usage:
+
+```bash
+sudo ./oneida lo0   # Loopback
+sudo ./oneida en0   # Wi‑Fi
+```
+
+### Live Capture (Linux)
+
+```bash
+sudo ./oneida eth0
+```
+
+### Offline PCAP
+
+```bash
+sudo ./oneida capture.pcap
+```
+
+When anomalies are detected, Oneida prints alerts similar to:
+
+```text
+🚨 STEG ALERT [0.67] 1a2b3c4d5e6f7890 | 12345→443 | Pkts:127
+   Timing:0.82 Len:0.45 Proto:0.31
+```
 
 ---
 
-## Usage
+## Roadmap Ideas
 
-### Live capture on one interface
+These are natural next steps on top of the core detector:
 
-```bash
-sudo ./oneida -i eth0
-```
-
-### Live capture on multiple interfaces
-
-Capture on two wired interfaces:
-
-```bash
-sudo ./oneida -i eth0 -i eth1
-```
-
-Capture on wired + Wi‑Fi:
-
-```bash
-sudo ./oneida -i eth0 -i wlan0
-```
-
-Capture on loopback and an external interface:
-
-```bash
-sudo ./oneida -i lo -i eth0
-```
-
-Using a shell variable with multiple interfaces:
-
-```bash
-IFACES="eth0 eth1 wlan0"
-sudo ./oneida $(for i in $IFACES; do printf -- " -i %s" "$i"; done)
-```
-
-Each `-i` creates a separate libpcap handle and capture thread; all packets are fed into a shared worker pool for analysis.[web:44][web:96]
-
-### Offline analysis from a pcap file
-
-```bash
-sudo ./oneida traffic.pcap
-```
-
-If no `-i` options are given and the last argument is a readable file, Oneida runs in offline mode and processes the capture from disk.
+- Plugin / module system for custom detectors
+- Python or Lua scripting interface
+- Integrated ML‑based scoring (autoencoders, Isolation Forest, clustering)
+- Visualization and forensics UI (timing graphs, entropy plots, state diagrams)
+- Benchmark suite with synthetic covert‑channel generators and labeled datasets
 
 ---
 
-## Alerts
+## License (MIT)
 
-Typical alerts look like:
+Copyright (c) 2026 Max Gecse
 
-- IPID / timing anomaly:
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
-  ```text
-  [ALERT] IPID/timing anomaly 192.0.2.10:43210 -> 198.51.100.5:80
-          IPID std(diff): 742.13, time std(diff): 0.012345
-  ```
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
-- TCP timestamp anomaly:
-
-  ```text
-  [ALERT] TSval autocorrelation anomaly 192.0.2.10:43210 -> 198.51.100.5:80
-          max |R(k)| at lag 3: 0.57
-  [ALERT] TCP timestamp anomaly 192.0.2.10:43210 -> 198.51.100.5:80
-          TSval std(diff): 8123.00, LSB(1) fraction: 0.910
-  ```
-
-- Timing entropy / CCE / chi‑square anomaly:
-
-  ```text
-  [ALERT] Timing anomaly (entropy/CCE/chi-square) 192.0.2.10:43210 -> 198.51.100.5:80
-          H: 1.842 bits, CCE: 1.200 bits, chi^2: 45.73
-  ```
-
-Thresholds are compile‑time constants in the source file (`STD_IPID_THRESHOLD`, `ENTROPY_LOW_THRESHOLD`, `CCE_LOW_THRESHOLD`, `CHI_SIG_THRESHOLD`, etc.) and should be tuned per environment.
-
----
-
-## Limitations
-
-- IPv4 + TCP only (no IPv6 support yet).
-- Heuristic detector; expect both false positives and false negatives.
-- Static IPD baseline (`ipd_expected_prob`); for serious use, replace with a learned or environment‑specific baseline.
-- Linux‑centric implementation (e.g., Linux SLL/SLL2 link types, some headers). Non‑Linux builds may require minor conditional compilation.
-
----
-
-## Contributing / Notes
-
-- Pull requests for:
-  - IPv6 support
-  - Configurable thresholds via CLI or config file
-  - JSON/NDJSON structured logging
-  - Better baseline learning and persistence  
-  are welcome.
-- When modifying code, keep the MIT license header and attribution to Max Gecse in both `license.txt` and the source file header to comply with the license terms.[web:67][web:125]
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
-
-
-## Author and License
-
-- Author: Max Gecse  
-- License: MIT
-
-MIT License
-
-Copyright (c) <2026> Max Gecse
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the “Software”), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice (including the next
-paragraph) shall be included in all copies or substantial portions of the
-Software.
-
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-```
-
