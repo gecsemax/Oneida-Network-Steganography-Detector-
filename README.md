@@ -93,6 +93,12 @@ When anomalous flows are detected, Oneida prints alerts like:
    Timing:0.80 Len:0.40 Proto:0.25
 ```
 
+
+
+For a step‑by‑step detection walkthrough, see `USAGE.md`.
+
+
+
 ---
 
 ## 🧪 Development Notes
