@@ -112,5 +112,3 @@ git add README.md
 git commit -m "Update README for Oneida v3.1 core"
 git push
 ```
-
-Sources
