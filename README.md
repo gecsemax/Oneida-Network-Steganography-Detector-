@@ -1,5 +1,3 @@
-Update it to match your new v3.1 core like this:
-
 ```markdown
 # 🚀 Oneida v3.1 – Network Steganography Detector
 
