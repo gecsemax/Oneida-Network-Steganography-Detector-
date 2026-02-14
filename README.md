@@ -1,7 +1,7 @@
 ```markdown
 # 🚀 Oneida v3.1 – Network Steganography Detector
 
-Author: **Max Gecse**  
+Author: Max Gecse  
 License: **MIT**
 
 Oneida is a network steganography and covert‑channel detector.  
