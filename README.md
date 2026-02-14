@@ -2,7 +2,7 @@
 # 🚀 Oneida v3.1 – Network Steganography Detector
 
 Author: Max Gecse  
-License: **MIT**
+License: MIT
 
 Oneida is a network steganography and covert‑channel detector.  
 v3.1 is a compact, macOS‑compatible core focused on per‑flow anomaly scoring over IPv4/TCP/UDP, designed as a solid base for research and future extensions (ML, plugins, visualization, etc.).[web:338][web:332]
