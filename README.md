@@ -103,12 +103,3 @@ When anomalous flows are detected, Oneida prints alerts like:
 This project is licensed under the terms of the **MIT** license.  
 See the `LICENSE` file for the full text.
 ```
-
-Then:
-
-```bash
-cd ~/oneida-stego-detector/oneida-stego-detector
-git add README.md
-git commit -m "Update README for Oneida v3.1 core"
-git push
-```
