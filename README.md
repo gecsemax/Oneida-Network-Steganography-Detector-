@@ -1,5 +1,6 @@
 ```markdown
-# Oneida — Network Steganography Detector
+# Oneida v4.2 – Network Steganography Detector
+
 
 > A high-performance, 12-channel network covert channel detector written in C.  
 > Designed for live traffic analysis and PCAP replay on Linux and macOS.
