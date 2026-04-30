@@ -20,24 +20,7 @@
 #include <netinet/ip_icmp.h>
 #include <arpa/inet.h>
 
-/* ============================================================
- * Oneida v4.2
- * 12-Channel Network Steganography Detector
- *
- * Fixed vs v4.1:
- *   [B1] Ch7 TTL direction corrected: high var = suspicious
- *   [B2] slot_valid[] now used in window_variance (no v==0 skip)
- *   [B3] Cleanup deadlock fixed: bucket lock released before mutex
- *   [B4] pool_free_head/tail changed to uint32_t (overflow fix)
- *   [B5] Source detection uses stat() instead of strstr
- *   [B6] sem_post capped with sem_getvalue guard
- *   [B7] ICMP support added (BPF + parser + flow tracking)
- *   [B8] Dirty flag: full rescore every WINDOW_SIZE/4 packets
- *   [B9] SIGUSR1 live stats handler
- *   [B10] IP-ID delta channel (Ch 5 now implemented)
- *   [B11] DNS tunnel: charset + rate + record type heuristics
- *   [B12] g_alert_count atomic counter, printed on exit
- * ============================================================ */
+
 
 /* ── Constants ── */
 #ifndef MAX_FLOWS
