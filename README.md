@@ -1,10 +1,6 @@
 ```markdown
 
-| 🆓 Open Source | 💼 Commercial |
-|---|---|
-| **v4.2** (final release) | **v4.3+** available now |
 
-**Enterprise licensing & support:** [![LinkedIn](https://img.shields.io/badge/LinkedIn-Max_Gecse-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/max-gecse/)
 
 # Oneida v4.2 – Network Steganography Detector
 
