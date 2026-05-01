@@ -404,6 +404,12 @@ sudo sysctl -w net.core.rmem_max=134217728
 
 MIT License — see `LICENSE` for details.
 
+
+**Oneida v4.2** is the final open-source release. **Versions 4.3+** are available under commercial license. 
+
+Contact [![LinkedIn](https://img.shields.io/badge/LinkedIn-Max_Gecse-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/max-gecse/) for enterprise licensing and support.
+
+
 ```text
 Copyright (c) 2026 Max Gecse
 ```
